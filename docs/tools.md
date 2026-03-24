@@ -829,3 +829,41 @@ Reference:
 -   [ThreadOptions reference](ref/extensions/experimental/codex/thread_options.md)
 -   [TurnOptions reference](ref/extensions/experimental/codex/turn_options.md)
 -   See `examples/tools/codex.py`, `examples/tools/codex_same_thread.py`, and `examples/tools/codex_builder_qa.py` for complete runnable samples.
+
+## Experimental: Codex builder / QA tool
+
+The `codex_builder_qa_tool` wraps a planner plus separate Codex-backed builder and evaluator
+loops into one reusable function tool. Use it when you want an agent to take a short coding task,
+expand it into a concrete plan, build against a workspace, and iterate until QA passes or the
+round limit is reached.
+
+```python
+from agents import Agent
+from agents.extensions.experimental.codex import codex_builder_qa_tool
+
+agent = Agent(
+    name="Builder harness agent",
+    instructions="Always use the codex_builder_qa tool for implementation tasks.",
+    tools=[
+        codex_builder_qa_tool(
+            working_directory="/path/to/workspace",
+            default_max_rounds=2,
+        )
+    ],
+)
+```
+
+Start with these option groups:
+
+-   Workspace: `working_directory` points the tool at a target repo or directory. If omitted,
+    `create_scratch_workspace=True` creates a temporary scaffolded workspace instead.
+-   Models and behavior: `planner_model`, `planner_model_settings`, and the planner / builder / QA
+    instruction overrides let you steer the harness behavior.
+-   Codex execution: `builder_thread_options` and `qa_thread_options` configure the two Codex
+    sub-loops independently, including models, reasoning effort, approvals, network access, and
+    additional directories.
+-   Streaming: `builder_on_stream` and `qa_on_stream` expose the underlying Codex events for each
+    role.
+
+Results include the workspace path, artifact directory, plan, per-round builder / QA reports, the
+final verdict, and the builder / QA Codex thread IDs.
