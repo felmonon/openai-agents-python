@@ -4,8 +4,11 @@ from .builder_qa_tool import (
     CodexBuilderQAToolOptions,
     CodexBuilderQAToolParameters,
     CodexBuilderQAToolResult,
+    ContractReview,
+    ContractReviewIssue,
     EvaluationIssue,
     EvaluationReport,
+    RoundContract,
     codex_builder_qa_tool,
 )
 from .codex import Codex
@@ -96,6 +99,9 @@ __all__ = [
     "ErrorItem",
     "BuildPlan",
     "BuildRoundReport",
+    "RoundContract",
+    "ContractReviewIssue",
+    "ContractReview",
     "EvaluationIssue",
     "EvaluationReport",
     "codex_builder_qa_tool",

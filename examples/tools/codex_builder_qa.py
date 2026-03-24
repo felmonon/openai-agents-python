@@ -225,8 +225,9 @@ async def main() -> None:
     agent = Agent(
         name="Codex Builder QA Agent",
         instructions=(
-            "Always use the codex_builder_qa tool to plan, build, and review the user's request. "
-            "Return a concise summary of the final verdict, workspace, and artifact directory."
+            "Always use the codex_builder_qa tool to plan, contract, build, and review the "
+            "user's request. Return a concise summary of the final verdict, workspace, artifact "
+            "directory, and state file."
         ),
         tools=[
             codex_builder_qa_tool(

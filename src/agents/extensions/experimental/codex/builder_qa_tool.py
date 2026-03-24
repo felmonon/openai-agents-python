@@ -45,6 +45,18 @@ DEFAULT_BUILDER_INSTRUCTIONS = (
     "working behavior over broad but stubbed scope. Before you finish each round, run the most "
     "relevant local checks you can and inspect the changed files."
 )
+DEFAULT_CONTRACT_BUILDER_INSTRUCTIONS = (
+    "You are the generator's pre-implementation contract pass in a planner / generator / "
+    "evaluator coding harness. Always use the codex_builder tool. Do not edit files during "
+    "contract negotiation. Propose a focused, testable round contract that defines what this "
+    "round will ship, how it will be validated, and what is explicitly out of scope."
+)
+DEFAULT_CONTRACT_QA_INSTRUCTIONS = (
+    "You are the evaluator's contract review pass in a planner / generator / evaluator coding "
+    "harness. Always use the codex_qa tool. Review the proposed round contract before any "
+    "implementation begins. Approve only if the scope is coherent, testable, and aligned with the "
+    "product plan. If not, return a revise verdict with exact contract changes."
+)
 DEFAULT_QA_INSTRUCTIONS = (
     "You are the evaluator in a planner / generator / evaluator coding harness. Always use the "
     "codex_qa tool. Be skeptical. If a core requirement is stubbed, broken, or not actually "
@@ -85,6 +97,28 @@ class BuildPlan(BaseModel):
     qa_focus: list[str] = Field(default_factory=list)
 
 
+class RoundContract(BaseModel):
+    goal: str
+    scope: list[str] = Field(default_factory=list)
+    validations: list[str] = Field(default_factory=list)
+    acceptance_checks: list[str] = Field(default_factory=list)
+    out_of_scope: list[str] = Field(default_factory=list)
+
+
+class ContractReviewIssue(BaseModel):
+    title: str
+    rationale: str
+    required_change: str
+
+
+class ContractReview(BaseModel):
+    verdict: Literal["approve", "revise"]
+    summary: str
+    strengths: list[str] = Field(default_factory=list)
+    issues: list[ContractReviewIssue] = Field(default_factory=list)
+    required_changes: list[str] = Field(default_factory=list)
+
+
 class BuildRoundReport(BaseModel):
     summary: str
     completed_work: list[str] = Field(default_factory=list)
@@ -108,11 +142,13 @@ class EvaluationReport(BaseModel):
 
 
 class HarnessState(BaseModel):
-    version: Literal[1] = 1
+    version: int = 2
     task: str
     max_rounds: int
-    status: Literal["planning", "building", "qa", "completed"]
+    status: Literal["planning", "contract", "building", "qa", "completed"]
     current_round: int | None = None
+    current_contract_attempt: int | None = None
+    contract_phase: Literal["propose", "review"] | None = None
     created_scratch_workspace: bool = False
     planner_thread_id: str | None = None
     builder_thread_id: str | None = None
@@ -146,6 +182,8 @@ class CodexBuilderQAToolResult:
     builder_thread_id: str | None
     qa_thread_id: str | None
     plan: BuildPlan
+    contracts: list[RoundContract]
+    contract_reviews: list[ContractReview]
     build_reports: list[BuildRoundReport]
     qa_reports: list[EvaluationReport]
 
@@ -161,6 +199,8 @@ class CodexBuilderQAToolResult:
             "builder_thread_id": self.builder_thread_id,
             "qa_thread_id": self.qa_thread_id,
             "plan": self.plan.model_dump(),
+            "contracts": [contract.model_dump() for contract in self.contracts],
+            "contract_reviews": [review.model_dump() for review in self.contract_reviews],
             "build_reports": [report.model_dump() for report in self.build_reports],
             "qa_reports": [report.model_dump() for report in self.qa_reports],
         }
@@ -201,6 +241,7 @@ class CodexBuilderQAToolOptions:
     scratch_workspace_prefix: str = DEFAULT_SCRATCH_WORKSPACE_PREFIX
     artifact_dir_name: str = DEFAULT_ARTIFACT_DIR_NAME
     default_max_rounds: int = 2
+    max_contract_revisions: int = 2
     planner_on_stream: Callable[[CodexToolStreamEvent], MaybeAwaitable[None]] | None = None
     builder_on_stream: Callable[[CodexToolStreamEvent], MaybeAwaitable[None]] | None = None
     qa_on_stream: Callable[[CodexToolStreamEvent], MaybeAwaitable[None]] | None = None
@@ -234,6 +275,7 @@ def codex_builder_qa_tool(
     scratch_workspace_prefix: str | None = None,
     artifact_dir_name: str | None = None,
     default_max_rounds: int | None = None,
+    max_contract_revisions: int | None = None,
     planner_on_stream: Callable[[CodexToolStreamEvent], MaybeAwaitable[None]] | None = None,
     builder_on_stream: Callable[[CodexToolStreamEvent], MaybeAwaitable[None]] | None = None,
     qa_on_stream: Callable[[CodexToolStreamEvent], MaybeAwaitable[None]] | None = None,
@@ -287,6 +329,8 @@ def codex_builder_qa_tool(
         resolved_options.artifact_dir_name = artifact_dir_name
     if default_max_rounds is not None:
         resolved_options.default_max_rounds = default_max_rounds
+    if max_contract_revisions is not None:
+        resolved_options.max_contract_revisions = max_contract_revisions
     if planner_on_stream is not None:
         resolved_options.planner_on_stream = planner_on_stream
     if builder_on_stream is not None:
@@ -300,6 +344,8 @@ def codex_builder_qa_tool(
 
     if resolved_options.default_max_rounds < 1:
         raise UserError("Codex builder/QA tool default_max_rounds must be at least 1.")
+    if resolved_options.max_contract_revisions < 1:
+        raise UserError("Codex builder/QA tool max_contract_revisions must be at least 1.")
     if resolved_options.qa_start_command and not (
         resolved_options.qa_ready_url or resolved_options.qa_base_url
     ):
@@ -401,6 +447,18 @@ async def _run_builder_qa_harness(
         "build_round_",
         BuildRoundReport,
     )
+    contracts = _load_round_reports(
+        workspace,
+        options.artifact_dir_name,
+        "contract_round_",
+        RoundContract,
+    )
+    contract_reviews = _load_round_reports(
+        workspace,
+        options.artifact_dir_name,
+        "contract_review_round_",
+        ContractReview,
+    )
     qa_reports = _load_round_reports(
         workspace,
         options.artifact_dir_name,
@@ -420,6 +478,8 @@ async def _run_builder_qa_harness(
             created_scratch_workspace=state_created_scratch_workspace,
             harness_context=harness_context,
             plan=plan,
+            contracts=contracts,
+            contract_reviews=contract_reviews,
             build_reports=builder_reports,
             qa_reports=qa_reports,
         )
@@ -464,6 +524,44 @@ async def _run_builder_qa_harness(
             )
         ],
         model_settings=planner_model_settings,
+    )
+    contract_builder_agent = Agent(
+        name="contract_builder_agent",
+        instructions=DEFAULT_CONTRACT_BUILDER_INSTRUCTIONS,
+        tools=[
+            codex_tool(
+                name="codex_builder",
+                default_thread_options=_resolve_nested_thread_options(
+                    builder_thread_options,
+                    workspace=workspace,
+                    sandbox_mode=options.sandbox_mode,
+                    skip_git_repo_check=options.skip_git_repo_check,
+                ),
+                on_stream=options.builder_on_stream,
+                use_run_context_thread_id=True,
+            )
+        ],
+        model_settings=ModelSettings(tool_choice="required"),
+        output_type=RoundContract,
+    )
+    contract_qa_agent = Agent(
+        name="contract_evaluator_agent",
+        instructions=DEFAULT_CONTRACT_QA_INSTRUCTIONS,
+        tools=[
+            codex_tool(
+                name="codex_qa",
+                default_thread_options=_resolve_nested_thread_options(
+                    qa_thread_options,
+                    workspace=workspace,
+                    sandbox_mode=options.sandbox_mode,
+                    skip_git_repo_check=options.skip_git_repo_check,
+                ),
+                on_stream=options.qa_on_stream,
+                use_run_context_thread_id=True,
+            )
+        ],
+        model_settings=ModelSettings(tool_choice="required"),
+        output_type=ContractReview,
     )
     builder_agent = Agent(
         name="generator_agent",
@@ -514,6 +612,8 @@ async def _run_builder_qa_harness(
             state,
             status="planning",
             current_round=None,
+            current_contract_attempt=None,
+            contract_phase=None,
             harness_context=harness_context,
             final_verdict=None,
         )
@@ -535,14 +635,131 @@ async def _run_builder_qa_harness(
         build_reports=builder_reports,
         qa_reports=qa_reports,
     )
+    contract_round_number, contract_attempt, contract_phase = _normalize_contract_resume_state(
+        state=state,
+        contracts=contracts,
+        contract_reviews=contract_reviews,
+        build_reports=builder_reports,
+        qa_reports=qa_reports,
+    )
 
     for round_number in range(next_round_number, max_rounds + 1):
+        approved_contract = contracts[round_number - 1] if len(contracts) >= round_number else None
+        contract_review = (
+            contract_reviews[round_number - 1] if len(contract_reviews) >= round_number else None
+        )
+        if (
+            approved_contract is None
+            or contract_review is None
+            or contract_review.verdict != "approve"
+        ):
+            active_attempt = contract_attempt if round_number == contract_round_number else 1
+            active_phase: Literal["propose", "review"] = (
+                contract_phase if round_number == contract_round_number else "propose"
+            )
+            latest_contract_feedback: ContractReview | None = (
+                contract_review
+                if contract_review is not None and contract_review.verdict == "revise"
+                else None
+            )
+            while True:
+                if active_attempt > options.max_contract_revisions:
+                    raise UserError(
+                        "Codex builder/QA tool contract review did not converge within "
+                        f"{options.max_contract_revisions} attempts for round {round_number}."
+                    )
+                if active_phase == "review" and len(contracts) < round_number:
+                    active_phase = "propose"
+                if active_phase == "propose":
+                    _persist_harness_state(
+                        state_path,
+                        state,
+                        status="contract",
+                        current_round=round_number,
+                        current_contract_attempt=active_attempt,
+                        contract_phase="propose",
+                        harness_context=harness_context,
+                        final_verdict=None,
+                    )
+                    contract_result = await Runner.run(
+                        contract_builder_agent,
+                        _build_contract_builder_prompt(
+                            task=task,
+                            workspace=workspace,
+                            artifact_dir_name=options.artifact_dir_name,
+                            plan=plan,
+                            round_number=round_number,
+                            max_rounds=max_rounds,
+                            latest_feedback=latest_feedback,
+                            latest_contract_feedback=latest_contract_feedback,
+                        ),
+                        context=harness_context,
+                    )
+                    _accumulate_usage(ctx, contract_result.context_wrapper.usage)
+                    proposed_contract = contract_result.final_output_as(RoundContract)
+                    if len(contracts) >= round_number:
+                        contracts[round_number - 1] = proposed_contract
+                    else:
+                        contracts.append(proposed_contract)
+                    _write_json(
+                        contract_artifact_path(workspace, options.artifact_dir_name, round_number),
+                        proposed_contract,
+                    )
+                else:
+                    proposed_contract = contracts[round_number - 1]
+
+                _persist_harness_state(
+                    state_path,
+                    state,
+                    status="contract",
+                    current_round=round_number,
+                    current_contract_attempt=active_attempt,
+                    contract_phase="review",
+                    harness_context=harness_context,
+                    final_verdict=None,
+                )
+                contract_review_result = await Runner.run(
+                    contract_qa_agent,
+                    _build_contract_qa_prompt(
+                        task=task,
+                        workspace=workspace,
+                        artifact_dir_name=options.artifact_dir_name,
+                        plan=plan,
+                        round_number=round_number,
+                        proposed_contract=proposed_contract,
+                        latest_feedback=latest_feedback,
+                    ),
+                    context=harness_context,
+                )
+                _accumulate_usage(ctx, contract_review_result.context_wrapper.usage)
+                reviewed_contract = contract_review_result.final_output_as(ContractReview)
+                if len(contract_reviews) >= round_number:
+                    contract_reviews[round_number - 1] = reviewed_contract
+                else:
+                    contract_reviews.append(reviewed_contract)
+                _write_json(
+                    contract_review_artifact_path(
+                        workspace,
+                        options.artifact_dir_name,
+                        round_number,
+                    ),
+                    reviewed_contract,
+                )
+                if reviewed_contract.verdict == "approve":
+                    approved_contract = proposed_contract
+                    break
+                latest_contract_feedback = reviewed_contract
+                active_attempt += 1
+                active_phase = "propose"
+
         if run_builder_for_next_round:
             _persist_harness_state(
                 state_path,
                 state,
                 status="building",
                 current_round=round_number,
+                current_contract_attempt=None,
+                contract_phase=None,
                 harness_context=harness_context,
                 final_verdict=None,
             )
@@ -555,6 +772,7 @@ async def _run_builder_qa_harness(
                     plan=plan,
                     round_number=round_number,
                     max_rounds=max_rounds,
+                    approved_contract=approved_contract,
                     latest_feedback=latest_feedback,
                 ),
                 context=harness_context,
@@ -577,6 +795,8 @@ async def _run_builder_qa_harness(
             state,
             status="qa",
             current_round=round_number,
+            current_contract_attempt=None,
+            contract_phase=None,
             harness_context=harness_context,
             final_verdict=None,
         )
@@ -599,6 +819,7 @@ async def _run_builder_qa_harness(
                     artifact_dir_name=options.artifact_dir_name,
                     plan=plan,
                     round_number=round_number,
+                    approved_contract=approved_contract,
                     build_report=build_report,
                     browser_enabled=options.qa_computer is not None,
                     qa_base_url=options.qa_base_url,
@@ -627,6 +848,8 @@ async def _run_builder_qa_harness(
                 state,
                 status="completed",
                 current_round=round_number,
+                current_contract_attempt=None,
+                contract_phase=None,
                 harness_context=harness_context,
                 final_verdict=evaluation.verdict,
             )
@@ -637,11 +860,15 @@ async def _run_builder_qa_harness(
                 created_scratch_workspace=state_created_scratch_workspace,
                 harness_context=harness_context,
                 plan=plan,
+                contracts=contracts,
+                contract_reviews=contract_reviews,
                 build_reports=builder_reports,
                 qa_reports=qa_reports,
             )
 
         run_builder_for_next_round = True
+        contract_attempt = 1
+        contract_phase = "propose"
 
     if not qa_reports:
         raise UserError("Codex builder/QA tool did not produce a QA report.")
@@ -651,6 +878,8 @@ async def _run_builder_qa_harness(
         state,
         status="completed",
         current_round=len(qa_reports),
+        current_contract_attempt=None,
+        contract_phase=None,
         harness_context=harness_context,
         final_verdict=qa_reports[-1].verdict,
     )
@@ -661,6 +890,8 @@ async def _run_builder_qa_harness(
         created_scratch_workspace=state_created_scratch_workspace,
         harness_context=harness_context,
         plan=plan,
+        contracts=contracts,
+        contract_reviews=contract_reviews,
         build_reports=builder_reports,
         qa_reports=qa_reports,
     )
@@ -726,6 +957,16 @@ def harness_state_path(workspace: Path, artifact_dir_name: str) -> Path:
     return workspace / artifact_dir_name / "state.json"
 
 
+def contract_artifact_path(workspace: Path, artifact_dir_name: str, round_number: int) -> Path:
+    return workspace / artifact_dir_name / f"contract_round_{round_number}.json"
+
+
+def contract_review_artifact_path(
+    workspace: Path, artifact_dir_name: str, round_number: int
+) -> Path:
+    return workspace / artifact_dir_name / f"contract_review_round_{round_number}.json"
+
+
 def build_artifact_path(workspace: Path, artifact_dir_name: str, round_number: int) -> Path:
     return workspace / artifact_dir_name / f"build_round_{round_number}.json"
 
@@ -774,13 +1015,17 @@ def _persist_harness_state(
     path: Path,
     state: HarnessState,
     *,
-    status: Literal["planning", "building", "qa", "completed"],
+    status: Literal["planning", "contract", "building", "qa", "completed"],
     current_round: int | None,
+    current_contract_attempt: int | None,
+    contract_phase: Literal["propose", "review"] | None,
     harness_context: _HarnessContext,
     final_verdict: str | None,
 ) -> None:
     state.status = status
     state.current_round = current_round
+    state.current_contract_attempt = current_contract_attempt
+    state.contract_phase = contract_phase
     state.planner_thread_id = harness_context.codex_thread_id_planner
     state.builder_thread_id = harness_context.codex_thread_id_builder
     state.qa_thread_id = harness_context.codex_thread_id_qa
@@ -803,6 +1048,30 @@ def _resolve_resume_position(
     return len(qa_reports) + 1, True
 
 
+def _normalize_contract_resume_state(
+    *,
+    state: HarnessState,
+    contracts: list[RoundContract],
+    contract_reviews: list[ContractReview],
+    build_reports: list[BuildRoundReport],
+    qa_reports: list[EvaluationReport],
+) -> tuple[int, int, Literal["propose", "review"]]:
+    if state.status != "contract":
+        return len(qa_reports) + 1, 1, "propose"
+
+    round_number = state.current_round or 1
+    attempt = state.current_contract_attempt or 1
+    phase = state.contract_phase or "propose"
+
+    if len(contract_reviews) >= round_number and len(build_reports) < round_number:
+        latest_review = contract_reviews[round_number - 1]
+        if latest_review.verdict == "approve":
+            return round_number, attempt, "review"
+        if phase == "review":
+            return round_number, attempt + 1, "propose"
+    return round_number, attempt, phase
+
+
 def _build_result(
     *,
     workspace: Path,
@@ -811,6 +1080,8 @@ def _build_result(
     created_scratch_workspace: bool,
     harness_context: _HarnessContext,
     plan: BuildPlan,
+    contracts: list[RoundContract],
+    contract_reviews: list[ContractReview],
     build_reports: list[BuildRoundReport],
     qa_reports: list[EvaluationReport],
 ) -> CodexBuilderQAToolResult:
@@ -827,6 +1098,8 @@ def _build_result(
         builder_thread_id=harness_context.codex_thread_id_builder,
         qa_thread_id=harness_context.codex_thread_id_qa,
         plan=plan,
+        contracts=contracts,
+        contract_reviews=contract_reviews,
         build_reports=build_reports,
         qa_reports=qa_reports,
     )
@@ -988,6 +1261,7 @@ def _build_generator_prompt(
     plan: BuildPlan,
     round_number: int,
     max_rounds: int,
+    approved_contract: RoundContract,
     latest_feedback: EvaluationReport | None,
 ) -> str:
     feedback_text = (
@@ -999,14 +1273,18 @@ def _build_generator_prompt(
         f"User request:\n{task}\n\n"
         f"Workspace:\n{workspace}\n\n"
         f"Plan artifact:\n{plan_artifact_path(workspace, artifact_dir_name)}\n\n"
+        "Round contract artifact:\n"
+        f"{contract_artifact_path(workspace, artifact_dir_name, round_number)}\n\n"
         f"Round:\n{round_number} of {max_rounds}\n\n"
         "Build plan:\n"
         f"{plan.model_dump_json(indent=2)}\n\n"
+        "Approved round contract:\n"
+        f"{approved_contract.model_dump_json(indent=2)}\n\n"
         "Latest QA feedback:\n"
         f"{feedback_text}\n\n"
-        "Use the codex_builder tool to implement the next highest-value improvements now. "
-        "If previous QA feedback exists, prioritize fixing those issues before expanding scope. "
-        "Keep the workspace in a runnable state."
+        "Use the codex_builder tool to implement exactly this approved round contract now. "
+        "If previous QA feedback exists, prioritize fixing those issues within the approved scope "
+        "before expanding anything. Keep the workspace in a runnable state."
     )
 
 
@@ -1025,6 +1303,80 @@ def _build_planner_prompt(
     )
 
 
+def _build_contract_builder_prompt(
+    *,
+    task: str,
+    workspace: Path,
+    artifact_dir_name: str,
+    plan: BuildPlan,
+    round_number: int,
+    max_rounds: int,
+    latest_feedback: EvaluationReport | None,
+    latest_contract_feedback: ContractReview | None,
+) -> str:
+    qa_feedback_text = (
+        latest_feedback.model_dump_json(indent=2)
+        if latest_feedback
+        else "No previous end-of-round QA feedback."
+    )
+    contract_feedback_text = (
+        latest_contract_feedback.model_dump_json(indent=2)
+        if latest_contract_feedback
+        else "No previous contract review feedback for this round."
+    )
+    return (
+        f"User request:\n{task}\n\n"
+        f"Workspace:\n{workspace}\n\n"
+        f"Plan artifact:\n{plan_artifact_path(workspace, artifact_dir_name)}\n\n"
+        "Round contract artifact:\n"
+        f"{contract_artifact_path(workspace, artifact_dir_name, round_number)}\n\n"
+        f"Round:\n{round_number} of {max_rounds}\n\n"
+        "Build plan:\n"
+        f"{plan.model_dump_json(indent=2)}\n\n"
+        "Latest end-of-round QA feedback:\n"
+        f"{qa_feedback_text}\n\n"
+        "Latest contract review feedback:\n"
+        f"{contract_feedback_text}\n\n"
+        "Use the codex_builder tool to propose a focused RoundContract for the next build slice. "
+        "Do not implement code changes during this step."
+    )
+
+
+def _build_contract_qa_prompt(
+    *,
+    task: str,
+    workspace: Path,
+    artifact_dir_name: str,
+    plan: BuildPlan,
+    round_number: int,
+    proposed_contract: RoundContract,
+    latest_feedback: EvaluationReport | None,
+) -> str:
+    qa_feedback_text = (
+        latest_feedback.model_dump_json(indent=2)
+        if latest_feedback
+        else "No previous end-of-round QA feedback."
+    )
+    return (
+        f"User request:\n{task}\n\n"
+        f"Workspace:\n{workspace}\n\n"
+        f"Plan artifact:\n{plan_artifact_path(workspace, artifact_dir_name)}\n\n"
+        "Round contract artifact:\n"
+        f"{contract_artifact_path(workspace, artifact_dir_name, round_number)}\n\n"
+        "Contract review artifact:\n"
+        f"{contract_review_artifact_path(workspace, artifact_dir_name, round_number)}\n\n"
+        f"Round:\n{round_number}\n\n"
+        "Build plan:\n"
+        f"{plan.model_dump_json(indent=2)}\n\n"
+        "Latest end-of-round QA feedback:\n"
+        f"{qa_feedback_text}\n\n"
+        "Proposed round contract:\n"
+        f"{proposed_contract.model_dump_json(indent=2)}\n\n"
+        "Use the codex_qa tool to review this round contract before any implementation begins. "
+        "Approve only if the scope is coherent, testable, and aligned with the plan."
+    )
+
+
 def _build_qa_prompt(
     *,
     task: str,
@@ -1032,6 +1384,7 @@ def _build_qa_prompt(
     artifact_dir_name: str,
     plan: BuildPlan,
     round_number: int,
+    approved_contract: RoundContract,
     build_report: BuildRoundReport,
     browser_enabled: bool,
     qa_base_url: str | None,
@@ -1052,11 +1405,15 @@ def _build_qa_prompt(
         f"User request:\n{task}\n\n"
         f"Workspace:\n{workspace}\n\n"
         f"Plan artifact:\n{plan_artifact_path(workspace, artifact_dir_name)}\n\n"
+        "Round contract artifact:\n"
+        f"{contract_artifact_path(workspace, artifact_dir_name, round_number)}\n\n"
         "Builder report artifact:\n"
         f"{build_artifact_path(workspace, artifact_dir_name, round_number)}\n\n"
         f"Round:\n{round_number}\n\n"
         "Build plan:\n"
         f"{plan.model_dump_json(indent=2)}\n\n"
+        "Approved round contract:\n"
+        f"{approved_contract.model_dump_json(indent=2)}\n\n"
         "Latest builder report:\n"
         f"{build_report.model_dump_json(indent=2)}\n\n"
         f"{runtime_context}"

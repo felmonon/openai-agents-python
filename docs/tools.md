@@ -833,8 +833,8 @@ Reference:
 ## Experimental: Codex builder / QA tool
 
 The `codex_builder_qa_tool` wraps separate Codex-backed planner, builder, and evaluator loops into
-one reusable function tool. Use it when you want an agent to take a short coding task, expand it
-into a concrete plan, build against a workspace, and iterate until QA passes or the round limit is
+one reusable function tool. Use it when you want an agent to take a short coding task, negotiate a
+round contract, build against a workspace, and iterate until QA passes or the round limit is
 reached.
 
 ```python
@@ -857,11 +857,15 @@ Start with these option groups:
 
 -   Workspace: `working_directory` points the tool at a target repo or directory. If omitted,
     `create_scratch_workspace=True` creates a temporary scaffolded workspace instead.
--   Resumption: the harness writes `.codex-harness/state.json` alongside the plan and per-round
-    artifacts. Set `resume_existing_run=True` or pass `resume=true` in the tool call to continue
-    from an existing state instead of starting over.
+-   Resumption: the harness writes `.codex-harness/state.json` alongside the plan, contract, and
+    per-round artifacts. Set `resume_existing_run=True` or pass `resume=true` in the tool call to
+    continue from an existing state instead of starting over.
+-   Contract negotiation: `max_contract_revisions` caps how many propose / review cycles the
+    harness will spend tightening a round contract before it errors out.
 -   Models and behavior: `planner_model`, `planner_model_settings`, and the planner / builder / QA
-    instruction overrides let you steer the harness behavior.
+    instruction overrides let you steer the harness behavior. The planner should propose scope, QA
+    should approve or revise that scope, and the builder should implement against the agreed
+    contract.
 -   Codex execution: `planner_thread_options`, `builder_thread_options`, and `qa_thread_options`
     configure the three Codex sub-loops independently, including models, reasoning effort,
     approvals, network access, and additional directories.
@@ -872,5 +876,5 @@ Start with these option groups:
 -   Streaming: `planner_on_stream`, `builder_on_stream`, and `qa_on_stream` expose the underlying
     Codex events for each role.
 
-Results include the workspace path, artifact directory, state file, plan, per-round builder / QA
-reports, the final verdict, and the planner / builder / QA Codex thread IDs.
+Results include the workspace path, artifact directory, state file, plan, per-round contract and
+builder / QA reports, the final verdict, and the planner / builder / QA Codex thread IDs.

@@ -16,7 +16,10 @@ from agents.extensions.experimental.codex import (
     BuildRoundReport,
     CodexBuilderQAToolOptions,
     CodexBuilderQAToolResult,
+    ContractReview,
+    ContractReviewIssue,
     EvaluationReport,
+    RoundContract,
     codex_builder_qa_tool,
 )
 from agents.tool_context import ToolContext
@@ -33,6 +36,52 @@ class FakeRunResult:
         return self.final_output
 
 
+def make_plan() -> BuildPlan:
+    return BuildPlan(
+        project_name="Demo App",
+        product_goal="Ship a demo app",
+        architecture=["CLI"],
+        milestones=["Build the CLI"],
+        acceptance_criteria=["Commands work"],
+        qa_focus=["Regression"],
+    )
+
+
+def make_contract(round_number: int) -> RoundContract:
+    return RoundContract(
+        goal=f"Ship round {round_number}",
+        scope=[f"round-{round_number}-scope"],
+        validations=["pytest -q"],
+        acceptance_checks=[f"round-{round_number} acceptance"],
+        out_of_scope=["Unrelated polish"],
+    )
+
+
+def make_contract_review(
+    verdict: Literal["approve", "revise"],
+    *,
+    summary: str,
+    issue_title: str = "Tighten scope",
+) -> ContractReview:
+    return ContractReview(
+        verdict=verdict,
+        summary=summary,
+        strengths=["Focused scope"] if verdict == "approve" else [],
+        issues=(
+            []
+            if verdict == "approve"
+            else [
+                ContractReviewIssue(
+                    title=issue_title,
+                    rationale="The contract needs sharper acceptance checks.",
+                    required_change="Define an observable acceptance check.",
+                )
+            ]
+        ),
+        required_changes=[] if verdict == "approve" else ["Define an observable acceptance check."],
+    )
+
+
 def test_codex_builder_qa_tool_kw_matches_options() -> None:
     signature = inspect.signature(codex_builder_qa_tool)
     kw_only = [
@@ -47,30 +96,41 @@ def test_codex_builder_qa_tool_kw_matches_options() -> None:
 @pytest.mark.asyncio
 async def test_codex_builder_qa_tool_runs_multi_round_harness(monkeypatch, tmp_path: Path) -> None:
     planner_usage = Usage(requests=1, input_tokens=10, output_tokens=5, total_tokens=15)
+    contract_usage = Usage(requests=1, input_tokens=12, output_tokens=6, total_tokens=18)
     builder_usage = Usage(requests=1, input_tokens=20, output_tokens=10, total_tokens=30)
     qa_usage = Usage(requests=1, input_tokens=15, output_tokens=5, total_tokens=20)
+    contract_builder_calls = 0
+    contract_qa_calls = 0
     builder_calls = 0
     qa_calls = 0
 
     async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
-        nonlocal builder_calls, qa_calls
+        nonlocal contract_builder_calls, contract_qa_calls, builder_calls, qa_calls
         if agent.name == "planner_agent":
             assert any(getattr(tool, "name", None) == "codex_planner" for tool in agent.tools)
             context.codex_thread_id_planner = "planner-thread-1"
+            return FakeRunResult(make_plan(), planner_usage)
+        if agent.name == "contract_builder_agent":
+            contract_builder_calls += 1
+            context.codex_thread_id_builder = f"builder-thread-contract-{contract_builder_calls}"
+            assert "Round contract artifact:" in input_data
+            return FakeRunResult(make_contract(contract_builder_calls), contract_usage)
+        if agent.name == "contract_evaluator_agent":
+            contract_qa_calls += 1
+            context.codex_thread_id_qa = f"qa-thread-contract-{contract_qa_calls}"
+            if contract_qa_calls == 1:
+                assert '"goal": "Ship round 1"' in input_data
             return FakeRunResult(
-                BuildPlan(
-                    project_name="Demo App",
-                    product_goal="Ship a demo app",
-                    architecture=["CLI"],
-                    milestones=["Build the CLI"],
-                    acceptance_criteria=["Commands work"],
-                    qa_focus=["Regression"],
+                make_contract_review(
+                    "approve",
+                    summary=f"contract review round {contract_qa_calls}",
                 ),
-                planner_usage,
+                contract_usage,
             )
         if agent.name == "generator_agent":
             builder_calls += 1
             context.codex_thread_id_builder = f"builder-thread-{builder_calls}"
+            assert "Approved round contract:" in input_data
             return FakeRunResult(
                 BuildRoundReport(
                     summary=f"builder round {builder_calls}",
@@ -122,11 +182,15 @@ async def test_codex_builder_qa_tool_runs_multi_round_harness(monkeypatch, tmp_p
     assert result.planner_thread_id == "planner-thread-1"
     assert result.builder_thread_id == "builder-thread-2"
     assert result.qa_thread_id == "qa-thread-2"
-    assert context.usage.total_tokens == 15 + 30 + 20 + 30 + 20
+    assert len(result.contracts) == 2
+    assert len(result.contract_reviews) == 2
+    assert context.usage.total_tokens == 15 + 18 + 18 + 30 + 20 + 18 + 18 + 30 + 20
 
     artifact_dir = tmp_path / "workspace" / ".codex-harness"
     assert (artifact_dir / "plan.json").exists()
     assert (artifact_dir / "state.json").exists()
+    assert (artifact_dir / "contract_round_1.json").exists()
+    assert (artifact_dir / "contract_review_round_1.json").exists()
     assert (artifact_dir / "build_round_1.json").exists()
     assert (artifact_dir / "build_round_2.json").exists()
     assert (artifact_dir / "qa_round_1.json").exists()
@@ -138,6 +202,7 @@ async def test_codex_builder_qa_tool_runs_multi_round_harness(monkeypatch, tmp_p
     assert stringified["rounds_completed"] == 2
     assert stringified["planner_thread_id"] == "planner-thread-1"
     assert stringified["state_file"] == str(artifact_dir / "state.json")
+    assert len(stringified["contracts"]) == 2
 
 
 @pytest.mark.asyncio
@@ -147,16 +212,13 @@ async def test_codex_builder_qa_tool_scratch_workspace_sets_src_pythonpath(
     async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
         if agent.name == "planner_agent":
             context.codex_thread_id_planner = "planner-thread"
-            return FakeRunResult(
-                BuildPlan(
-                    project_name="Scratch App",
-                    product_goal="Ship scratch app",
-                    architecture=[],
-                    milestones=[],
-                    acceptance_criteria=[],
-                    qa_focus=[],
-                )
-            )
+            return FakeRunResult(make_plan())
+        if agent.name == "contract_builder_agent":
+            context.codex_thread_id_builder = "builder-thread-contract"
+            return FakeRunResult(make_contract(1))
+        if agent.name == "contract_evaluator_agent":
+            context.codex_thread_id_qa = "qa-thread-contract"
+            return FakeRunResult(make_contract_review("approve", summary="contract approved"))
         if agent.name == "generator_agent":
             context.codex_thread_id_builder = "builder-thread"
             return FakeRunResult(
@@ -206,16 +268,13 @@ async def test_codex_builder_qa_tool_adds_browser_qa_context(monkeypatch, tmp_pa
     async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
         if agent.name == "planner_agent":
             context.codex_thread_id_planner = "planner-thread"
-            return FakeRunResult(
-                BuildPlan(
-                    project_name="Browser App",
-                    product_goal="Ship browser app",
-                    architecture=[],
-                    milestones=[],
-                    acceptance_criteria=[],
-                    qa_focus=[],
-                )
-            )
+            return FakeRunResult(make_plan())
+        if agent.name == "contract_builder_agent":
+            context.codex_thread_id_builder = "builder-thread-contract"
+            return FakeRunResult(make_contract(1))
+        if agent.name == "contract_evaluator_agent":
+            context.codex_thread_id_qa = "qa-thread-contract"
+            return FakeRunResult(make_contract_review("approve", summary="contract approved"))
         if agent.name == "generator_agent":
             context.codex_thread_id_builder = "builder-thread"
             return FakeRunResult(
@@ -264,6 +323,84 @@ async def test_codex_builder_qa_tool_adds_browser_qa_context(monkeypatch, tmp_pa
     result = await tool.on_invoke_tool(context, input_json)
 
     assert isinstance(result, CodexBuilderQAToolResult)
+    assert result.final_verdict == "pass"
+
+
+@pytest.mark.asyncio
+async def test_codex_builder_qa_tool_contract_round_blocks_implementation_until_approved(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    call_order: list[str] = []
+
+    async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
+        call_order.append(agent.name)
+        if agent.name == "planner_agent":
+            context.codex_thread_id_planner = "planner-thread"
+            return FakeRunResult(make_plan())
+        if agent.name == "contract_builder_agent":
+            context.codex_thread_id_builder = "builder-thread-contract"
+            assert "Do not implement code changes during this step." in input_data
+            return FakeRunResult(make_contract(1))
+        if agent.name == "contract_evaluator_agent":
+            assert '"goal": "Ship round 1"' in input_data
+            context.codex_thread_id_qa = "qa-thread-contract"
+            return FakeRunResult(make_contract_review("approve", summary="contract approved"))
+        if agent.name == "evaluator_agent":
+            assert "Approved round contract:" in input_data
+            context.codex_thread_id_qa = "qa-thread"
+            return FakeRunResult(
+                EvaluationReport(
+                    verdict="pass",
+                    summary="qa approved implementation",
+                    strengths=["Contract is acceptable"],
+                    issues=[],
+                    next_actions=[],
+                )
+            )
+        if agent.name == "generator_agent":
+            context.codex_thread_id_builder = "builder-thread"
+            return FakeRunResult(
+                BuildRoundReport(
+                    summary="implemented after approval",
+                    completed_work=["contracted feature"],
+                    validations_run=["pytest -q"],
+                    remaining_risks=[],
+                )
+            )
+        raise AssertionError(f"Unexpected agent: {agent.name}")
+
+    monkeypatch.setattr(
+        "agents.extensions.experimental.codex.builder_qa_tool.Runner.run",
+        fake_run,
+    )
+
+    tool = codex_builder_qa_tool(
+        working_directory=str(tmp_path / "workspace"),
+        create_scratch_workspace=False,
+        default_max_rounds=1,
+    )
+    input_json = json.dumps({"task": "Build a contract-gated app"})
+    context = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call-1",
+        tool_arguments=input_json,
+    )
+
+    result = await tool.on_invoke_tool(context, input_json)
+
+    artifact_dir = tmp_path / "workspace" / ".codex-harness"
+    assert call_order == [
+        "planner_agent",
+        "contract_builder_agent",
+        "contract_evaluator_agent",
+        "generator_agent",
+        "evaluator_agent",
+    ]
+    assert (artifact_dir / "contract_round_1.json").exists()
+    assert (artifact_dir / "contract_review_round_1.json").exists()
+    assert result.rounds_completed == 1
     assert result.final_verdict == "pass"
 
 
@@ -365,12 +502,23 @@ async def test_codex_builder_qa_tool_resumes_existing_rounds(monkeypatch, tmp_pa
     async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
         if agent.name == "planner_agent":
             raise AssertionError("Planner should not run when resuming a planned harness.")
+        if agent.name == "contract_builder_agent":
+            assert context.codex_thread_id_planner == "planner-thread-1"
+            assert "Latest end-of-round QA feedback:" in input_data
+            assert '"verdict": "revise"' in input_data
+            context.codex_thread_id_builder = "builder-thread-contract-2"
+            return FakeRunResult(make_contract(2))
+        if agent.name == "contract_evaluator_agent":
+            assert context.codex_thread_id_qa == "qa-thread-1"
+            context.codex_thread_id_qa = "qa-thread-contract-2"
+            return FakeRunResult(make_contract_review("approve", summary="contract approved"))
         if agent.name == "generator_agent":
             assert context.codex_thread_id_planner == "planner-thread-1"
-            assert context.codex_thread_id_builder == "builder-thread-1"
+            assert context.codex_thread_id_builder == "builder-thread-contract-2"
             context.codex_thread_id_builder = "builder-thread-2"
             assert "Latest QA feedback:" in input_data
             assert '"verdict": "revise"' in input_data
+            assert "Approved round contract:" in input_data
             return FakeRunResult(
                 BuildRoundReport(
                     summary="builder round 2",
@@ -380,7 +528,7 @@ async def test_codex_builder_qa_tool_resumes_existing_rounds(monkeypatch, tmp_pa
                 )
             )
         if agent.name == "evaluator_agent":
-            assert context.codex_thread_id_qa == "qa-thread-1"
+            assert context.codex_thread_id_qa == "qa-thread-contract-2"
             context.codex_thread_id_qa = "qa-thread-2"
             return FakeRunResult(
                 EvaluationReport(
@@ -418,6 +566,8 @@ async def test_codex_builder_qa_tool_resumes_existing_rounds(monkeypatch, tmp_pa
     assert result.planner_thread_id == "planner-thread-1"
     assert result.builder_thread_id == "builder-thread-2"
     assert result.qa_thread_id == "qa-thread-2"
+    assert len(result.contracts) == 1
+    assert len(result.contract_reviews) == 1
     state = json.loads((artifact_dir / "state.json").read_text(encoding="utf-8"))
     assert state["status"] == "completed"
     assert state["current_round"] == 2
@@ -522,16 +672,13 @@ async def test_codex_builder_qa_tool_starts_and_stops_qa_server(
         nonlocal qa_calls
         if agent.name == "planner_agent":
             context.codex_thread_id_planner = "planner-thread"
-            return FakeRunResult(
-                BuildPlan(
-                    project_name="Browser App",
-                    product_goal="Ship browser app",
-                    architecture=[],
-                    milestones=[],
-                    acceptance_criteria=[],
-                    qa_focus=[],
-                )
-            )
+            return FakeRunResult(make_plan())
+        if agent.name == "contract_builder_agent":
+            context.codex_thread_id_builder = "builder-thread-contract"
+            return FakeRunResult(make_contract(1 if qa_calls == 0 else 2))
+        if agent.name == "contract_evaluator_agent":
+            context.codex_thread_id_qa = "qa-thread-contract"
+            return FakeRunResult(make_contract_review("approve", summary="contract approved"))
         if agent.name == "generator_agent":
             context.codex_thread_id_builder = "builder-thread"
             return FakeRunResult(
