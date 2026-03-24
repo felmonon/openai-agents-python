@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
+import os
+import signal
 import tempfile
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import IO, Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
 from agents import Agent, ModelSettings, Runner, Usage, UserError, default_tool_error_function
 from agents.run_context import RunContextWrapper
-from agents.tool import FunctionTool, ToolErrorFunction, function_tool
+from agents.tool import ComputerConfig, ComputerTool, FunctionTool, ToolErrorFunction, function_tool
 from agents.tool_context import ToolContext
 from agents.util._types import MaybeAwaitable
 
@@ -42,8 +48,9 @@ DEFAULT_BUILDER_INSTRUCTIONS = (
 DEFAULT_QA_INSTRUCTIONS = (
     "You are the evaluator in a planner / generator / evaluator coding harness. Always use the "
     "codex_qa tool. Be skeptical. If a core requirement is stubbed, broken, or not actually "
-    "verified, fail the round. Inspect the workspace, run the most relevant checks you can, and "
-    "return concrete evidence plus specific next actions. Do not fix issues yourself."
+    "verified, fail the round. If a browser tool is available, exercise the live app before "
+    "deciding. Inspect the workspace, run the most relevant checks you can, and return concrete "
+    "evidence plus specific next actions. Do not fix issues yourself."
 )
 
 
@@ -138,6 +145,13 @@ class CodexBuilderQAToolResult:
 
 
 @dataclass
+class _QAServerProcess:
+    process: asyncio.subprocess.Process
+    log_path: Path
+    log_handle: IO[bytes]
+
+
+@dataclass
 class CodexBuilderQAToolOptions:
     name: str | None = None
     description: str | None = None
@@ -148,6 +162,11 @@ class CodexBuilderQAToolOptions:
     qa_instructions: str = DEFAULT_QA_INSTRUCTIONS
     builder_thread_options: ThreadOptions | Mapping[str, Any] | None = None
     qa_thread_options: ThreadOptions | Mapping[str, Any] | None = None
+    qa_computer: ComputerConfig[Any] | None = None
+    qa_start_command: str | None = None
+    qa_base_url: str | None = None
+    qa_ready_url: str | None = None
+    qa_startup_timeout_seconds: float = 30.0
     sandbox_mode: SandboxMode | None = None
     working_directory: str | None = None
     skip_git_repo_check: bool | None = None
@@ -173,6 +192,11 @@ def codex_builder_qa_tool(
     qa_instructions: str | None = None,
     builder_thread_options: ThreadOptions | Mapping[str, Any] | None = None,
     qa_thread_options: ThreadOptions | Mapping[str, Any] | None = None,
+    qa_computer: ComputerConfig[Any] | None = None,
+    qa_start_command: str | None = None,
+    qa_base_url: str | None = None,
+    qa_ready_url: str | None = None,
+    qa_startup_timeout_seconds: float | None = None,
     sandbox_mode: SandboxMode | None = None,
     working_directory: str | None = None,
     skip_git_repo_check: bool | None = None,
@@ -204,6 +228,16 @@ def codex_builder_qa_tool(
         resolved_options.builder_thread_options = builder_thread_options
     if qa_thread_options is not None:
         resolved_options.qa_thread_options = qa_thread_options
+    if qa_computer is not None:
+        resolved_options.qa_computer = qa_computer
+    if qa_start_command is not None:
+        resolved_options.qa_start_command = qa_start_command
+    if qa_base_url is not None:
+        resolved_options.qa_base_url = qa_base_url
+    if qa_ready_url is not None:
+        resolved_options.qa_ready_url = qa_ready_url
+    if qa_startup_timeout_seconds is not None:
+        resolved_options.qa_startup_timeout_seconds = qa_startup_timeout_seconds
     if sandbox_mode is not None:
         resolved_options.sandbox_mode = sandbox_mode
     if working_directory is not None:
@@ -229,6 +263,14 @@ def codex_builder_qa_tool(
 
     if resolved_options.default_max_rounds < 1:
         raise UserError("Codex builder/QA tool default_max_rounds must be at least 1.")
+    if resolved_options.qa_start_command and not (
+        resolved_options.qa_ready_url or resolved_options.qa_base_url
+    ):
+        raise UserError(
+            "Codex builder/QA tool qa_start_command requires qa_ready_url or qa_base_url."
+        )
+    if resolved_options.qa_startup_timeout_seconds <= 0:
+        raise UserError("Codex builder/QA tool qa_startup_timeout_seconds must be positive.")
 
     tool_name = resolved_options.name or DEFAULT_HARNESS_TOOL_NAME
     tool_description = resolved_options.description or (
@@ -326,22 +368,26 @@ async def _run_builder_qa_harness(
         model_settings=ModelSettings(tool_choice="required"),
         output_type=BuildRoundReport,
     )
+    qa_tools: list[Any] = [
+        codex_tool(
+            name="codex_qa",
+            default_thread_options=_resolve_nested_thread_options(
+                qa_thread_options,
+                workspace=workspace,
+                sandbox_mode=options.sandbox_mode,
+                skip_git_repo_check=options.skip_git_repo_check,
+            ),
+            on_stream=options.qa_on_stream,
+            use_run_context_thread_id=True,
+        )
+    ]
+    if options.qa_computer is not None:
+        qa_tools.append(ComputerTool(computer=options.qa_computer))
     qa_agent = Agent(
         name="evaluator_agent",
         instructions=options.qa_instructions,
-        tools=[
-            codex_tool(
-                name="codex_qa",
-                default_thread_options=_resolve_nested_thread_options(
-                    qa_thread_options,
-                    workspace=workspace,
-                    sandbox_mode=options.sandbox_mode,
-                    skip_git_repo_check=options.skip_git_repo_check,
-                ),
-                on_stream=options.qa_on_stream,
-                use_run_context_thread_id=True,
-            )
-        ],
+        tools=qa_tools,
+        model=DEFAULT_MODEL if options.qa_computer is not None else None,
         model_settings=ModelSettings(tool_choice="required"),
         output_type=EvaluationReport,
     )
@@ -375,18 +421,35 @@ async def _run_builder_qa_harness(
             build_report,
         )
 
-        qa_result = await Runner.run(
-            qa_agent,
-            _build_qa_prompt(
-                task=task,
+        qa_server: _QAServerProcess | None = None
+        if options.qa_start_command is not None:
+            qa_server = await _start_qa_server(
                 workspace=workspace,
                 artifact_dir_name=options.artifact_dir_name,
-                plan=plan,
                 round_number=round_number,
-                build_report=build_report,
-            ),
-            context=harness_context,
-        )
+                start_command=options.qa_start_command,
+                ready_url=options.qa_ready_url or options.qa_base_url,
+                startup_timeout_seconds=options.qa_startup_timeout_seconds,
+            )
+        try:
+            qa_result = await Runner.run(
+                qa_agent,
+                _build_qa_prompt(
+                    task=task,
+                    workspace=workspace,
+                    artifact_dir_name=options.artifact_dir_name,
+                    plan=plan,
+                    round_number=round_number,
+                    build_report=build_report,
+                    browser_enabled=options.qa_computer is not None,
+                    qa_base_url=options.qa_base_url,
+                    qa_server_log_file=qa_server.log_path if qa_server is not None else None,
+                ),
+                context=harness_context,
+            )
+        finally:
+            if qa_server is not None:
+                await _stop_qa_server(qa_server)
         _accumulate_usage(ctx, qa_result.context_wrapper.usage)
         evaluation = qa_result.final_output_as(EvaluationReport)
         qa_reports.append(evaluation)
@@ -480,9 +543,105 @@ def qa_artifact_path(workspace: Path, artifact_dir_name: str, round_number: int)
     return workspace / artifact_dir_name / f"qa_round_{round_number}.json"
 
 
+def qa_server_log_path(workspace: Path, artifact_dir_name: str, round_number: int) -> Path:
+    return workspace / artifact_dir_name / f"qa_server_round_{round_number}.log"
+
+
 def _write_json(path: Path, model: BaseModel) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(model.model_dump_json(indent=2), encoding="utf-8")
+
+
+async def _start_qa_server(
+    *,
+    workspace: Path,
+    artifact_dir_name: str,
+    round_number: int,
+    start_command: str,
+    ready_url: str | None,
+    startup_timeout_seconds: float,
+) -> _QAServerProcess:
+    log_path = qa_server_log_path(workspace, artifact_dir_name, round_number)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = log_path.open("wb")
+    process_kwargs: dict[str, Any] = {
+        "cwd": str(workspace),
+        "stdout": log_handle,
+        "stderr": asyncio.subprocess.STDOUT,
+    }
+    if os.name != "nt":
+        process_kwargs["start_new_session"] = True
+    process = await asyncio.create_subprocess_shell(start_command, **process_kwargs)
+    server = _QAServerProcess(process=process, log_path=log_path, log_handle=log_handle)
+    try:
+        if ready_url is not None:
+            await _wait_for_http_ready(
+                process=process,
+                ready_url=ready_url,
+                log_path=log_path,
+                timeout_seconds=startup_timeout_seconds,
+            )
+        else:
+            await asyncio.sleep(min(startup_timeout_seconds, 2.0))
+        return server
+    except Exception:
+        await _stop_qa_server(server)
+        raise
+
+
+async def _stop_qa_server(server: _QAServerProcess) -> None:
+    try:
+        if server.process.returncode is None:
+            if os.name != "nt" and server.process.pid is not None:
+                with suppress(ProcessLookupError):
+                    os.killpg(server.process.pid, signal.SIGTERM)
+            else:
+                server.process.terminate()
+            try:
+                await asyncio.wait_for(server.process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                if os.name != "nt" and server.process.pid is not None:
+                    with suppress(ProcessLookupError):
+                        os.killpg(server.process.pid, signal.SIGKILL)
+                else:
+                    server.process.kill()
+                await server.process.wait()
+    finally:
+        server.log_handle.close()
+
+
+async def _wait_for_http_ready(
+    *,
+    process: asyncio.subprocess.Process,
+    ready_url: str,
+    log_path: Path,
+    timeout_seconds: float,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while True:
+        if process.returncode is not None:
+            raise UserError(
+                "QA start command exited with code "
+                f"{process.returncode}. See server log: {log_path}"
+            )
+        if await asyncio.to_thread(_probe_ready_url, ready_url):
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise UserError(
+                f"Timed out waiting for QA server at {ready_url}. See server log: {log_path}"
+            )
+        await asyncio.sleep(0.5)
+
+
+def _probe_ready_url(ready_url: str) -> bool:
+    request = urllib.request.Request(ready_url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=2):
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except OSError:
+        return False
 
 
 def _resolve_nested_thread_options(
@@ -579,7 +738,21 @@ def _build_qa_prompt(
     plan: BuildPlan,
     round_number: int,
     build_report: BuildRoundReport,
+    browser_enabled: bool,
+    qa_base_url: str | None,
+    qa_server_log_file: Path | None,
 ) -> str:
+    runtime_notes: list[str] = []
+    if qa_base_url:
+        runtime_notes.append(f"QA base URL:\n{qa_base_url}\n")
+    if qa_server_log_file is not None:
+        runtime_notes.append(f"QA server log:\n{qa_server_log_file}\n")
+    if browser_enabled:
+        runtime_notes.append(
+            "Live browser QA:\nA computer tool is available for this round. Use it to interact "
+            "with the running app before deciding the verdict.\n"
+        )
+    runtime_context = "\n".join(runtime_notes)
     return (
         f"User request:\n{task}\n\n"
         f"Workspace:\n{workspace}\n\n"
@@ -591,7 +764,10 @@ def _build_qa_prompt(
         f"{plan.model_dump_json(indent=2)}\n\n"
         "Latest builder report:\n"
         f"{build_report.model_dump_json(indent=2)}\n\n"
+        f"{runtime_context}"
         "Use the codex_qa tool to inspect the workspace and decide whether the app is good enough "
-        "to stop. Fail if core acceptance criteria are missing, broken, or unverified. Prefer "
-        "concrete evidence such as commands run, files inspected, or observable behavior."
+        "to stop. If a computer tool is available, use it to verify live behavior before "
+        "finalizing the report. Fail if core acceptance criteria are missing, broken, or "
+        "unverified. Prefer concrete evidence such as commands run, files inspected, or "
+        "observable behavior."
     )

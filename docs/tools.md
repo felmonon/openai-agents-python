@@ -862,6 +862,10 @@ Start with these option groups:
 -   Codex execution: `builder_thread_options` and `qa_thread_options` configure the two Codex
     sub-loops independently, including models, reasoning effort, approvals, network access, and
     additional directories.
+-   Live app QA: `qa_computer` adds a [`ComputerTool`][agents.tool.ComputerTool] to the evaluator,
+    while `qa_start_command`, `qa_base_url`, `qa_ready_url`, and
+    `qa_startup_timeout_seconds` let the harness start a local app, wait for readiness, and point
+    the browser QA loop at the right URL.
 -   Streaming: `builder_on_stream` and `qa_on_stream` expose the underlying Codex events for each
     role.
 

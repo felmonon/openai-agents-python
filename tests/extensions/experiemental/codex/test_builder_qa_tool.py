@@ -5,7 +5,7 @@ import json
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import pytest
 
@@ -191,6 +191,180 @@ async def test_codex_builder_qa_tool_scratch_workspace_sets_src_pythonpath(
     pyproject = Path(result.workspace) / "pyproject.toml"
     assert pyproject.exists()
     assert 'pythonpath = ["src"]' in pyproject.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_codex_builder_qa_tool_adds_browser_qa_context(monkeypatch, tmp_path: Path) -> None:
+    async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
+        if agent.name == "planner_agent":
+            return FakeRunResult(
+                BuildPlan(
+                    project_name="Browser App",
+                    product_goal="Ship browser app",
+                    architecture=[],
+                    milestones=[],
+                    acceptance_criteria=[],
+                    qa_focus=[],
+                )
+            )
+        if agent.name == "generator_agent":
+            context.codex_thread_id_builder = "builder-thread"
+            return FakeRunResult(
+                BuildRoundReport(
+                    summary="built",
+                    completed_work=[],
+                    validations_run=[],
+                    remaining_risks=[],
+                )
+            )
+        if agent.name == "evaluator_agent":
+            assert any(getattr(tool, "trace_name", None) == "computer" for tool in agent.tools)
+            assert "QA base URL:\nhttp://127.0.0.1:4173" in input_data
+            assert "Live browser QA:" in input_data
+            context.codex_thread_id_qa = "qa-thread"
+            return FakeRunResult(
+                EvaluationReport(
+                    verdict="pass",
+                    summary="passed",
+                    strengths=[],
+                    issues=[],
+                    next_actions=[],
+                )
+            )
+        raise AssertionError(f"Unexpected agent: {agent.name}")
+
+    monkeypatch.setattr(
+        "agents.extensions.experimental.codex.builder_qa_tool.Runner.run",
+        fake_run,
+    )
+
+    tool = codex_builder_qa_tool(
+        working_directory=str(tmp_path / "workspace"),
+        create_scratch_workspace=False,
+        qa_computer=cast(Any, object()),
+        qa_base_url="http://127.0.0.1:4173",
+    )
+    input_json = json.dumps({"task": "Build a browser app"})
+    context = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call-1",
+        tool_arguments=input_json,
+    )
+
+    result = await tool.on_invoke_tool(context, input_json)
+
+    assert isinstance(result, CodexBuilderQAToolResult)
+    assert result.final_verdict == "pass"
+
+
+@pytest.mark.asyncio
+async def test_codex_builder_qa_tool_starts_and_stops_qa_server(
+    monkeypatch, tmp_path: Path
+) -> None:
+    start_calls: list[tuple[str, str | None, float, int]] = []
+    stop_calls: list[Path] = []
+    qa_calls = 0
+
+    async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
+        nonlocal qa_calls
+        if agent.name == "planner_agent":
+            return FakeRunResult(
+                BuildPlan(
+                    project_name="Browser App",
+                    product_goal="Ship browser app",
+                    architecture=[],
+                    milestones=[],
+                    acceptance_criteria=[],
+                    qa_focus=[],
+                )
+            )
+        if agent.name == "generator_agent":
+            context.codex_thread_id_builder = "builder-thread"
+            return FakeRunResult(
+                BuildRoundReport(
+                    summary="built",
+                    completed_work=[],
+                    validations_run=[],
+                    remaining_risks=[],
+                )
+            )
+        if agent.name == "evaluator_agent":
+            qa_calls += 1
+            assert "QA server log:\n" in input_data
+            context.codex_thread_id_qa = f"qa-thread-{qa_calls}"
+            return FakeRunResult(
+                EvaluationReport(
+                    verdict="revise" if qa_calls == 1 else "pass",
+                    summary="qa",
+                    strengths=[],
+                    issues=[],
+                    next_actions=[],
+                )
+            )
+        raise AssertionError(f"Unexpected agent: {agent.name}")
+
+    async def fake_start(
+        *,
+        workspace: Path,
+        artifact_dir_name: str,
+        round_number: int,
+        start_command: str,
+        ready_url: str | None,
+        startup_timeout_seconds: float,
+    ) -> Any:
+        log_path = workspace / artifact_dir_name / f"qa_server_round_{round_number}.log"
+        start_calls.append((start_command, ready_url, startup_timeout_seconds, round_number))
+        return SimpleNamespace(log_path=log_path)
+
+    async def fake_stop(server: Any) -> None:
+        stop_calls.append(server.log_path)
+
+    monkeypatch.setattr(
+        "agents.extensions.experimental.codex.builder_qa_tool.Runner.run",
+        fake_run,
+    )
+    monkeypatch.setattr(
+        "agents.extensions.experimental.codex.builder_qa_tool._start_qa_server",
+        fake_start,
+    )
+    monkeypatch.setattr(
+        "agents.extensions.experimental.codex.builder_qa_tool._stop_qa_server",
+        fake_stop,
+    )
+
+    tool = codex_builder_qa_tool(
+        working_directory=str(tmp_path / "workspace"),
+        create_scratch_workspace=False,
+        default_max_rounds=2,
+        qa_start_command="npm run dev",
+        qa_base_url="http://127.0.0.1:4173",
+        qa_startup_timeout_seconds=12.0,
+    )
+    input_json = json.dumps({"task": "Build a browser app"})
+    context = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call-1",
+        tool_arguments=input_json,
+    )
+
+    result = await tool.on_invoke_tool(context, input_json)
+
+    assert result.final_verdict == "pass"
+    assert start_calls == [
+        ("npm run dev", "http://127.0.0.1:4173", 12.0, 1),
+        ("npm run dev", "http://127.0.0.1:4173", 12.0, 2),
+    ]
+    assert stop_calls == [
+        tmp_path / "workspace" / ".codex-harness" / "qa_server_round_1.log",
+        tmp_path / "workspace" / ".codex-harness" / "qa_server_round_2.log",
+    ]
+
+
+def test_codex_builder_qa_tool_requires_ready_target_for_qa_server() -> None:
+    with pytest.raises(UserError, match="qa_start_command requires qa_ready_url or qa_base_url"):
+        codex_builder_qa_tool(qa_start_command="npm run dev")
 
 
 @pytest.mark.asyncio
