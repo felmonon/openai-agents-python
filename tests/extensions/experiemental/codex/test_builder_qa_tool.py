@@ -55,6 +55,8 @@ async def test_codex_builder_qa_tool_runs_multi_round_harness(monkeypatch, tmp_p
     async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
         nonlocal builder_calls, qa_calls
         if agent.name == "planner_agent":
+            assert any(getattr(tool, "name", None) == "codex_planner" for tool in agent.tools)
+            context.codex_thread_id_planner = "planner-thread-1"
             return FakeRunResult(
                 BuildPlan(
                     project_name="Demo App",
@@ -117,6 +119,7 @@ async def test_codex_builder_qa_tool_runs_multi_round_harness(monkeypatch, tmp_p
     assert isinstance(result, CodexBuilderQAToolResult)
     assert result.final_verdict == "pass"
     assert result.rounds_completed == 2
+    assert result.planner_thread_id == "planner-thread-1"
     assert result.builder_thread_id == "builder-thread-2"
     assert result.qa_thread_id == "qa-thread-2"
     assert context.usage.total_tokens == 15 + 30 + 20 + 30 + 20
@@ -133,6 +136,7 @@ async def test_codex_builder_qa_tool_runs_multi_round_harness(monkeypatch, tmp_p
     stringified = json.loads(str(result))
     assert stringified["final_verdict"] == "pass"
     assert stringified["rounds_completed"] == 2
+    assert stringified["planner_thread_id"] == "planner-thread-1"
     assert stringified["state_file"] == str(artifact_dir / "state.json")
 
 
@@ -142,6 +146,7 @@ async def test_codex_builder_qa_tool_scratch_workspace_sets_src_pythonpath(
 ) -> None:
     async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
         if agent.name == "planner_agent":
+            context.codex_thread_id_planner = "planner-thread"
             return FakeRunResult(
                 BuildPlan(
                     project_name="Scratch App",
@@ -200,6 +205,7 @@ async def test_codex_builder_qa_tool_scratch_workspace_sets_src_pythonpath(
 async def test_codex_builder_qa_tool_adds_browser_qa_context(monkeypatch, tmp_path: Path) -> None:
     async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
         if agent.name == "planner_agent":
+            context.codex_thread_id_planner = "planner-thread"
             return FakeRunResult(
                 BuildPlan(
                     project_name="Browser App",
@@ -277,6 +283,7 @@ async def test_codex_builder_qa_tool_requires_resume_for_existing_state(
                 "status": "planning",
                 "current_round": None,
                 "created_scratch_workspace": False,
+                "planner_thread_id": None,
                 "builder_thread_id": None,
                 "qa_thread_id": None,
                 "final_verdict": None,
@@ -346,6 +353,7 @@ async def test_codex_builder_qa_tool_resumes_existing_rounds(monkeypatch, tmp_pa
                 "status": "building",
                 "current_round": 2,
                 "created_scratch_workspace": False,
+                "planner_thread_id": "planner-thread-1",
                 "builder_thread_id": "builder-thread-1",
                 "qa_thread_id": "qa-thread-1",
                 "final_verdict": None,
@@ -358,6 +366,7 @@ async def test_codex_builder_qa_tool_resumes_existing_rounds(monkeypatch, tmp_pa
         if agent.name == "planner_agent":
             raise AssertionError("Planner should not run when resuming a planned harness.")
         if agent.name == "generator_agent":
+            assert context.codex_thread_id_planner == "planner-thread-1"
             assert context.codex_thread_id_builder == "builder-thread-1"
             context.codex_thread_id_builder = "builder-thread-2"
             assert "Latest QA feedback:" in input_data
@@ -406,11 +415,13 @@ async def test_codex_builder_qa_tool_resumes_existing_rounds(monkeypatch, tmp_pa
 
     assert result.final_verdict == "pass"
     assert result.rounds_completed == 2
+    assert result.planner_thread_id == "planner-thread-1"
     assert result.builder_thread_id == "builder-thread-2"
     assert result.qa_thread_id == "qa-thread-2"
     state = json.loads((artifact_dir / "state.json").read_text(encoding="utf-8"))
     assert state["status"] == "completed"
     assert state["current_round"] == 2
+    assert state["planner_thread_id"] == "planner-thread-1"
     assert state["final_verdict"] == "pass"
 
 
@@ -461,6 +472,7 @@ async def test_codex_builder_qa_tool_returns_completed_resume_without_running(
                 "status": "completed",
                 "current_round": 1,
                 "created_scratch_workspace": False,
+                "planner_thread_id": "planner-thread-1",
                 "builder_thread_id": "builder-thread-1",
                 "qa_thread_id": "qa-thread-1",
                 "final_verdict": "pass",
@@ -493,6 +505,7 @@ async def test_codex_builder_qa_tool_returns_completed_resume_without_running(
 
     assert result.final_verdict == "pass"
     assert result.rounds_completed == 1
+    assert result.planner_thread_id == "planner-thread-1"
     assert result.builder_thread_id == "builder-thread-1"
     assert result.qa_thread_id == "qa-thread-1"
 
@@ -508,6 +521,7 @@ async def test_codex_builder_qa_tool_starts_and_stops_qa_server(
     async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
         nonlocal qa_calls
         if agent.name == "planner_agent":
+            context.codex_thread_id_planner = "planner-thread"
             return FakeRunResult(
                 BuildPlan(
                     project_name="Browser App",

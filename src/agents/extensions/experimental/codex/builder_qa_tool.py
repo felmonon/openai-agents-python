@@ -32,11 +32,11 @@ DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_REASONING_EFFORT: Literal["medium"] = "medium"
 
 DEFAULT_PLANNER_INSTRUCTIONS = (
-    "You are the planner in a long-running coding harness. Expand a terse product request into a "
-    "concrete build plan that a coding agent and a QA agent can execute. Be ambitious enough to "
-    "produce a real product, but keep the scope small enough that it can plausibly converge in a "
-    "few implementation rounds. Focus on product behavior, verification criteria, and likely "
-    "risks rather than low-level implementation trivia."
+    "You are the planner in a long-running coding harness. Always use the codex_planner tool. "
+    "Expand a terse product request into a concrete build plan that a coding agent and a QA agent "
+    "can execute. Be ambitious enough to produce a real product, but keep the scope small enough "
+    "that it can plausibly converge in a few implementation rounds. Focus on product behavior, "
+    "verification criteria, and likely risks rather than low-level implementation trivia."
 )
 DEFAULT_BUILDER_INSTRUCTIONS = (
     "You are the generator in a planner / generator / evaluator coding harness. Always use the "
@@ -114,12 +114,14 @@ class HarnessState(BaseModel):
     status: Literal["planning", "building", "qa", "completed"]
     current_round: int | None = None
     created_scratch_workspace: bool = False
+    planner_thread_id: str | None = None
     builder_thread_id: str | None = None
     qa_thread_id: str | None = None
     final_verdict: str | None = None
 
 
 class _HarnessContext(BaseModel):
+    codex_thread_id_planner: str | None = None
     codex_thread_id_builder: str | None = None
     codex_thread_id_qa: str | None = None
 
@@ -140,6 +142,7 @@ class CodexBuilderQAToolResult:
     created_scratch_workspace: bool
     rounds_completed: int
     final_verdict: str
+    planner_thread_id: str | None
     builder_thread_id: str | None
     qa_thread_id: str | None
     plan: BuildPlan
@@ -154,6 +157,7 @@ class CodexBuilderQAToolResult:
             "created_scratch_workspace": self.created_scratch_workspace,
             "rounds_completed": self.rounds_completed,
             "final_verdict": self.final_verdict,
+            "planner_thread_id": self.planner_thread_id,
             "builder_thread_id": self.builder_thread_id,
             "qa_thread_id": self.qa_thread_id,
             "plan": self.plan.model_dump(),
@@ -179,6 +183,7 @@ class CodexBuilderQAToolOptions:
     planner_model: str | None = None
     planner_model_settings: ModelSettings | None = None
     planner_instructions: str = DEFAULT_PLANNER_INSTRUCTIONS
+    planner_thread_options: ThreadOptions | Mapping[str, Any] | None = None
     builder_instructions: str = DEFAULT_BUILDER_INSTRUCTIONS
     qa_instructions: str = DEFAULT_QA_INSTRUCTIONS
     builder_thread_options: ThreadOptions | Mapping[str, Any] | None = None
@@ -196,6 +201,7 @@ class CodexBuilderQAToolOptions:
     scratch_workspace_prefix: str = DEFAULT_SCRATCH_WORKSPACE_PREFIX
     artifact_dir_name: str = DEFAULT_ARTIFACT_DIR_NAME
     default_max_rounds: int = 2
+    planner_on_stream: Callable[[CodexToolStreamEvent], MaybeAwaitable[None]] | None = None
     builder_on_stream: Callable[[CodexToolStreamEvent], MaybeAwaitable[None]] | None = None
     qa_on_stream: Callable[[CodexToolStreamEvent], MaybeAwaitable[None]] | None = None
     is_enabled: bool | Callable[[RunContextWrapper[Any], Any], MaybeAwaitable[bool]] = True
@@ -210,6 +216,7 @@ def codex_builder_qa_tool(
     planner_model: str | None = None,
     planner_model_settings: ModelSettings | None = None,
     planner_instructions: str | None = None,
+    planner_thread_options: ThreadOptions | Mapping[str, Any] | None = None,
     builder_instructions: str | None = None,
     qa_instructions: str | None = None,
     builder_thread_options: ThreadOptions | Mapping[str, Any] | None = None,
@@ -227,6 +234,7 @@ def codex_builder_qa_tool(
     scratch_workspace_prefix: str | None = None,
     artifact_dir_name: str | None = None,
     default_max_rounds: int | None = None,
+    planner_on_stream: Callable[[CodexToolStreamEvent], MaybeAwaitable[None]] | None = None,
     builder_on_stream: Callable[[CodexToolStreamEvent], MaybeAwaitable[None]] | None = None,
     qa_on_stream: Callable[[CodexToolStreamEvent], MaybeAwaitable[None]] | None = None,
     is_enabled: bool | Callable[[RunContextWrapper[Any], Any], MaybeAwaitable[bool]] | None = None,
@@ -243,6 +251,8 @@ def codex_builder_qa_tool(
         resolved_options.planner_model_settings = planner_model_settings
     if planner_instructions is not None:
         resolved_options.planner_instructions = planner_instructions
+    if planner_thread_options is not None:
+        resolved_options.planner_thread_options = planner_thread_options
     if builder_instructions is not None:
         resolved_options.builder_instructions = builder_instructions
     if qa_instructions is not None:
@@ -277,6 +287,8 @@ def codex_builder_qa_tool(
         resolved_options.artifact_dir_name = artifact_dir_name
     if default_max_rounds is not None:
         resolved_options.default_max_rounds = default_max_rounds
+    if planner_on_stream is not None:
+        resolved_options.planner_on_stream = planner_on_stream
     if builder_on_stream is not None:
         resolved_options.builder_on_stream = builder_on_stream
     if qa_on_stream is not None:
@@ -347,6 +359,7 @@ def _coerce_tool_options(
             raise UserError(f"Unknown Codex builder/QA tool option(s): {sorted(unknown)}")
         resolved = CodexBuilderQAToolOptions(**dict(options))
 
+    resolved.planner_thread_options = coerce_thread_options(resolved.planner_thread_options)
     resolved.builder_thread_options = coerce_thread_options(resolved.builder_thread_options)
     resolved.qa_thread_options = coerce_thread_options(resolved.qa_thread_options)
     return resolved
@@ -378,6 +391,7 @@ async def _run_builder_qa_harness(
         state.created_scratch_workspace if state is not None else created_scratch_workspace
     )
     harness_context = _HarnessContext(
+        codex_thread_id_planner=state.planner_thread_id if state is not None else None,
         codex_thread_id_builder=state.builder_thread_id if state is not None else None,
         codex_thread_id_qa=state.qa_thread_id if state is not None else None,
     )
@@ -424,12 +438,33 @@ async def _run_builder_qa_harness(
         "model": options.planner_model,
         "output_type": BuildPlan,
     }
-    if options.planner_model_settings is not None:
-        planner_agent_kwargs["model_settings"] = options.planner_model_settings
+    planner_thread_options = cast(ThreadOptions | None, options.planner_thread_options)
     builder_thread_options = cast(ThreadOptions | None, options.builder_thread_options)
     qa_thread_options = cast(ThreadOptions | None, options.qa_thread_options)
 
-    planner_agent = Agent(**planner_agent_kwargs)
+    planner_model_settings = (
+        dataclasses.replace(options.planner_model_settings, tool_choice="required")
+        if options.planner_model_settings is not None
+        else ModelSettings(tool_choice="required")
+    )
+
+    planner_agent = Agent(
+        **planner_agent_kwargs,
+        tools=[
+            codex_tool(
+                name="codex_planner",
+                default_thread_options=_resolve_nested_thread_options(
+                    planner_thread_options,
+                    workspace=workspace,
+                    sandbox_mode=options.sandbox_mode,
+                    skip_git_repo_check=options.skip_git_repo_check,
+                ),
+                on_stream=options.planner_on_stream,
+                use_run_context_thread_id=True,
+            )
+        ],
+        model_settings=planner_model_settings,
+    )
     builder_agent = Agent(
         name="generator_agent",
         instructions=options.builder_instructions,
@@ -482,7 +517,15 @@ async def _run_builder_qa_harness(
             harness_context=harness_context,
             final_verdict=None,
         )
-        plan_result = await Runner.run(planner_agent, task)
+        plan_result = await Runner.run(
+            planner_agent,
+            _build_planner_prompt(
+                task=task,
+                workspace=workspace,
+                artifact_dir_name=options.artifact_dir_name,
+            ),
+            context=harness_context,
+        )
         _accumulate_usage(ctx, plan_result.context_wrapper.usage)
         plan = plan_result.final_output_as(BuildPlan)
         _write_json(plan_artifact_path(workspace, options.artifact_dir_name), plan)
@@ -738,6 +781,7 @@ def _persist_harness_state(
 ) -> None:
     state.status = status
     state.current_round = current_round
+    state.planner_thread_id = harness_context.codex_thread_id_planner
     state.builder_thread_id = harness_context.codex_thread_id_builder
     state.qa_thread_id = harness_context.codex_thread_id_qa
     state.final_verdict = final_verdict
@@ -779,6 +823,7 @@ def _build_result(
         created_scratch_workspace=created_scratch_workspace,
         rounds_completed=len(qa_reports),
         final_verdict=qa_reports[-1].verdict,
+        planner_thread_id=harness_context.codex_thread_id_planner,
         builder_thread_id=harness_context.codex_thread_id_builder,
         qa_thread_id=harness_context.codex_thread_id_qa,
         plan=plan,
@@ -962,6 +1007,21 @@ def _build_generator_prompt(
         "Use the codex_builder tool to implement the next highest-value improvements now. "
         "If previous QA feedback exists, prioritize fixing those issues before expanding scope. "
         "Keep the workspace in a runnable state."
+    )
+
+
+def _build_planner_prompt(
+    *,
+    task: str,
+    workspace: Path,
+    artifact_dir_name: str,
+) -> str:
+    return (
+        f"User request:\n{task}\n\n"
+        f"Workspace:\n{workspace}\n\n"
+        f"Plan artifact path:\n{plan_artifact_path(workspace, artifact_dir_name)}\n\n"
+        "Use the codex_planner tool to inspect the workspace if needed and produce a concrete "
+        "BuildPlan for the builder and QA roles."
     )
 
 

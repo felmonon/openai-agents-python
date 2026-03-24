@@ -237,6 +237,7 @@ async def main() -> None:
                 qa_start_command=args.qa_start_command,
                 qa_base_url=args.qa_base_url,
                 resume_existing_run=args.resume,
+                planner_on_stream=make_stream_logger("planner"),
                 builder_on_stream=make_stream_logger("builder"),
                 qa_on_stream=make_stream_logger("qa"),
             )

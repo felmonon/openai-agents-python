@@ -832,10 +832,10 @@ Reference:
 
 ## Experimental: Codex builder / QA tool
 
-The `codex_builder_qa_tool` wraps a planner plus separate Codex-backed builder and evaluator
-loops into one reusable function tool. Use it when you want an agent to take a short coding task,
-expand it into a concrete plan, build against a workspace, and iterate until QA passes or the
-round limit is reached.
+The `codex_builder_qa_tool` wraps separate Codex-backed planner, builder, and evaluator loops into
+one reusable function tool. Use it when you want an agent to take a short coding task, expand it
+into a concrete plan, build against a workspace, and iterate until QA passes or the round limit is
+reached.
 
 ```python
 from agents import Agent
@@ -862,15 +862,15 @@ Start with these option groups:
     from an existing state instead of starting over.
 -   Models and behavior: `planner_model`, `planner_model_settings`, and the planner / builder / QA
     instruction overrides let you steer the harness behavior.
--   Codex execution: `builder_thread_options` and `qa_thread_options` configure the two Codex
-    sub-loops independently, including models, reasoning effort, approvals, network access, and
-    additional directories.
+-   Codex execution: `planner_thread_options`, `builder_thread_options`, and `qa_thread_options`
+    configure the three Codex sub-loops independently, including models, reasoning effort,
+    approvals, network access, and additional directories.
 -   Live app QA: `qa_computer` adds a [`ComputerTool`][agents.tool.ComputerTool] to the evaluator,
     while `qa_start_command`, `qa_base_url`, `qa_ready_url`, and
     `qa_startup_timeout_seconds` let the harness start a local app, wait for readiness, and point
     the browser QA loop at the right URL.
--   Streaming: `builder_on_stream` and `qa_on_stream` expose the underlying Codex events for each
-    role.
+-   Streaming: `planner_on_stream`, `builder_on_stream`, and `qa_on_stream` expose the underlying
+    Codex events for each role.
 
 Results include the workspace path, artifact directory, state file, plan, per-round builder / QA
-reports, the final verdict, and the builder / QA Codex thread IDs.
+reports, the final verdict, and the planner / builder / QA Codex thread IDs.
