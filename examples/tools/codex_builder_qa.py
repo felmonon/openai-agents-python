@@ -155,6 +155,17 @@ def parse_args() -> argparse.Namespace:
         help="Maximum builder / QA rounds. Defaults to 2, or 1 in auto mode.",
     )
     parser.add_argument(
+        "--execution-backend",
+        choices=["codex", "local_tools"],
+        default="codex",
+        help="Execution backend for the planner / builder / QA roles.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Optional model to use for the outer agent and nested role agents.",
+    )
+    parser.add_argument(
         "--qa-start-command",
         help="Optional command to start the app before each QA round, for example `npm run dev`.",
     )
@@ -224,6 +235,7 @@ async def main() -> None:
 
     agent = Agent(
         name="Codex Builder QA Agent",
+        model=args.model,
         instructions=(
             "Always use the codex_builder_qa tool to plan, contract, build, and review the "
             "user's request. Return a concise summary of the final verdict, workspace, artifact "
@@ -231,9 +243,13 @@ async def main() -> None:
         ),
         tools=[
             codex_builder_qa_tool(
+                execution_backend=args.execution_backend,
                 working_directory=args.working_directory,
                 create_scratch_workspace=args.working_directory is None,
                 default_max_rounds=max_rounds,
+                planner_model=args.model,
+                builder_model=args.model,
+                qa_model=args.model,
                 qa_computer=qa_computer,
                 qa_start_command=args.qa_start_command,
                 qa_base_url=args.qa_base_url,

@@ -855,6 +855,10 @@ agent = Agent(
 
 Start with these option groups:
 
+-   Execution backend: `execution_backend="codex"` uses nested Codex roles for planner /
+    builder / QA. `execution_backend="local_tools"` swaps those roles to local `ShellTool` and
+    `ApplyPatchTool` execution, which is useful when you want a more provider-agnostic runtime and
+    your model provider supports tool calling plus structured JSON outputs.
 -   Workspace: `working_directory` points the tool at a target repo or directory. If omitted,
     `create_scratch_workspace=True` creates a temporary scaffolded workspace instead.
 -   Resumption: the harness writes `.codex-harness/state.json` alongside the plan, contract, and
@@ -862,13 +866,13 @@ Start with these option groups:
     continue from an existing state instead of starting over.
 -   Contract negotiation: `max_contract_revisions` caps how many propose / review cycles the
     harness will spend tightening a round contract before it errors out.
--   Models and behavior: `planner_model`, `planner_model_settings`, and the planner / builder / QA
-    instruction overrides let you steer the harness behavior. The planner should propose scope, QA
-    should approve or revise that scope, and the builder should implement against the agreed
-    contract.
+-   Models and behavior: `planner_model`, `builder_model`, `qa_model`, their corresponding
+    `ModelSettings`, and the planner / builder / QA instruction overrides let you steer the
+    harness behavior. The planner should propose scope, QA should approve or revise that scope,
+    and the builder should implement against the agreed contract.
 -   Codex execution: `planner_thread_options`, `builder_thread_options`, and `qa_thread_options`
-    configure the three Codex sub-loops independently, including models, reasoning effort,
-    approvals, network access, and additional directories.
+    configure the three Codex sub-loops independently when `execution_backend="codex"`,
+    including models, reasoning effort, approvals, network access, and additional directories.
 -   Live app QA: `qa_computer` adds a [`ComputerTool`][agents.tool.ComputerTool] to the evaluator,
     while `qa_start_command`, `qa_base_url`, `qa_ready_url`, and
     `qa_startup_timeout_seconds` let the harness start a local app, wait for readiness, and point
@@ -876,5 +880,6 @@ Start with these option groups:
 -   Streaming: `planner_on_stream`, `builder_on_stream`, and `qa_on_stream` expose the underlying
     Codex events for each role.
 
-Results include the workspace path, artifact directory, state file, plan, per-round contract and
-builder / QA reports, the final verdict, and the planner / builder / QA Codex thread IDs.
+Results include the workspace path, artifact directory, state file, execution backend, plan,
+per-round contract and builder / QA reports, the final verdict, and the planner / builder / QA
+thread IDs.

@@ -16,7 +16,22 @@ from typing import IO, Any, Literal, TypeVar, cast
 
 from pydantic import BaseModel, Field
 
-from agents import Agent, ModelSettings, Runner, Usage, UserError, default_tool_error_function
+from agents import (
+    Agent,
+    ApplyPatchTool,
+    ModelSettings,
+    Runner,
+    ShellCallOutcome,
+    ShellCommandOutput,
+    ShellCommandRequest,
+    ShellResult,
+    ShellTool,
+    Usage,
+    UserError,
+    apply_diff,
+    default_tool_error_function,
+)
+from agents.editor import ApplyPatchOperation, ApplyPatchResult
 from agents.run_context import RunContextWrapper
 from agents.tool import ComputerConfig, ComputerTool, FunctionTool, ToolErrorFunction, function_tool
 from agents.tool_context import ToolContext
@@ -30,6 +45,7 @@ DEFAULT_ARTIFACT_DIR_NAME = ".codex-harness"
 DEFAULT_SCRATCH_WORKSPACE_PREFIX = "codex-builder-qa-"
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_REASONING_EFFORT: Literal["medium"] = "medium"
+ExecutionBackend = Literal["codex", "local_tools"]
 
 DEFAULT_PLANNER_INSTRUCTIONS = (
     "You are the planner in a long-running coding harness. Always use the codex_planner tool. "
@@ -144,6 +160,7 @@ class EvaluationReport(BaseModel):
 class HarnessState(BaseModel):
     version: int = 2
     task: str
+    execution_backend: ExecutionBackend = "codex"
     max_rounds: int
     status: Literal["planning", "contract", "building", "qa", "completed"]
     current_round: int | None = None
@@ -175,6 +192,7 @@ class CodexBuilderQAToolResult:
     workspace: str
     artifact_dir: str
     state_file: str
+    execution_backend: ExecutionBackend
     created_scratch_workspace: bool
     rounds_completed: int
     final_verdict: str
@@ -192,6 +210,7 @@ class CodexBuilderQAToolResult:
             "workspace": self.workspace,
             "artifact_dir": self.artifact_dir,
             "state_file": self.state_file,
+            "execution_backend": self.execution_backend,
             "created_scratch_workspace": self.created_scratch_workspace,
             "rounds_completed": self.rounds_completed,
             "final_verdict": self.final_verdict,
@@ -216,15 +235,101 @@ class _QAServerProcess:
     log_handle: IO[bytes]
 
 
+class _WorkspaceEditor:
+    def __init__(self, root: Path) -> None:
+        self._root = root.resolve()
+
+    def create_file(self, operation: ApplyPatchOperation) -> ApplyPatchResult:
+        target = self._resolve(operation.path, ensure_parent=True)
+        content = apply_diff("", operation.diff or "", mode="create")
+        target.write_text(content, encoding="utf-8")
+        return ApplyPatchResult(status="completed", output=f"Created {target.name}")
+
+    def update_file(self, operation: ApplyPatchOperation) -> ApplyPatchResult:
+        target = self._resolve(operation.path)
+        original = target.read_text(encoding="utf-8")
+        patched = apply_diff(original, operation.diff or "")
+        target.write_text(patched, encoding="utf-8")
+        return ApplyPatchResult(status="completed", output=f"Updated {target.name}")
+
+    def delete_file(self, operation: ApplyPatchOperation) -> ApplyPatchResult:
+        target = self._resolve(operation.path)
+        target.unlink(missing_ok=True)
+        return ApplyPatchResult(status="completed", output=f"Deleted {target.name}")
+
+    def _resolve(self, relative: str, ensure_parent: bool = False) -> Path:
+        candidate = Path(relative)
+        target = candidate if candidate.is_absolute() else (self._root / candidate)
+        target = target.resolve()
+        try:
+            target.relative_to(self._root)
+        except ValueError:
+            raise RuntimeError(f"Apply patch operation outside workspace: {relative}") from None
+        if ensure_parent:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        return target
+
+
+class _WorkspaceShellExecutor:
+    def __init__(self, root: Path) -> None:
+        self._root = root.resolve()
+
+    async def __call__(self, request: ShellCommandRequest) -> ShellResult:
+        action = request.data.action
+        outputs: list[ShellCommandOutput] = []
+        for command in action.commands:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                cwd=self._root,
+                env=os.environ.copy(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            timed_out = False
+            try:
+                timeout = (action.timeout_ms or 0) / 1000 or None
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                stdout_bytes, stderr_bytes = await proc.communicate()
+                timed_out = True
+
+            outputs.append(
+                ShellCommandOutput(
+                    command=command,
+                    stdout=stdout_bytes.decode("utf-8", errors="ignore"),
+                    stderr=stderr_bytes.decode("utf-8", errors="ignore"),
+                    outcome=ShellCallOutcome(
+                        type="timeout" if timed_out else "exit",
+                        exit_code=getattr(proc, "returncode", None),
+                    ),
+                )
+            )
+            if timed_out:
+                break
+
+        return ShellResult(
+            output=outputs,
+            provider_data={"working_directory": str(self._root)},
+        )
+
+
 @dataclass
 class CodexBuilderQAToolOptions:
     name: str | None = None
     description: str | None = None
+    execution_backend: ExecutionBackend = "codex"
     planner_model: str | None = None
     planner_model_settings: ModelSettings | None = None
     planner_instructions: str = DEFAULT_PLANNER_INSTRUCTIONS
     planner_thread_options: ThreadOptions | Mapping[str, Any] | None = None
+    builder_model: str | None = None
+    builder_model_settings: ModelSettings | None = None
     builder_instructions: str = DEFAULT_BUILDER_INSTRUCTIONS
+    qa_model: str | None = None
+    qa_model_settings: ModelSettings | None = None
     qa_instructions: str = DEFAULT_QA_INSTRUCTIONS
     builder_thread_options: ThreadOptions | Mapping[str, Any] | None = None
     qa_thread_options: ThreadOptions | Mapping[str, Any] | None = None
@@ -254,11 +359,16 @@ def codex_builder_qa_tool(
     *,
     name: str | None = None,
     description: str | None = None,
+    execution_backend: ExecutionBackend | None = None,
     planner_model: str | None = None,
     planner_model_settings: ModelSettings | None = None,
     planner_instructions: str | None = None,
     planner_thread_options: ThreadOptions | Mapping[str, Any] | None = None,
+    builder_model: str | None = None,
+    builder_model_settings: ModelSettings | None = None,
     builder_instructions: str | None = None,
+    qa_model: str | None = None,
+    qa_model_settings: ModelSettings | None = None,
     qa_instructions: str | None = None,
     builder_thread_options: ThreadOptions | Mapping[str, Any] | None = None,
     qa_thread_options: ThreadOptions | Mapping[str, Any] | None = None,
@@ -287,6 +397,8 @@ def codex_builder_qa_tool(
         resolved_options.name = name
     if description is not None:
         resolved_options.description = description
+    if execution_backend is not None:
+        resolved_options.execution_backend = execution_backend
     if planner_model is not None:
         resolved_options.planner_model = planner_model
     if planner_model_settings is not None:
@@ -295,8 +407,16 @@ def codex_builder_qa_tool(
         resolved_options.planner_instructions = planner_instructions
     if planner_thread_options is not None:
         resolved_options.planner_thread_options = planner_thread_options
+    if builder_model is not None:
+        resolved_options.builder_model = builder_model
+    if builder_model_settings is not None:
+        resolved_options.builder_model_settings = builder_model_settings
     if builder_instructions is not None:
         resolved_options.builder_instructions = builder_instructions
+    if qa_model is not None:
+        resolved_options.qa_model = qa_model
+    if qa_model_settings is not None:
+        resolved_options.qa_model_settings = qa_model_settings
     if qa_instructions is not None:
         resolved_options.qa_instructions = qa_instructions
     if builder_thread_options is not None:
@@ -342,6 +462,8 @@ def codex_builder_qa_tool(
     if not isinstance(failure_error_function, _UnsetType):
         resolved_options.failure_error_function = failure_error_function
 
+    if resolved_options.execution_backend not in {"codex", "local_tools"}:
+        raise UserError('Codex builder/QA tool execution_backend must be "codex" or "local_tools".')
     if resolved_options.default_max_rounds < 1:
         raise UserError("Codex builder/QA tool default_max_rounds must be at least 1.")
     if resolved_options.max_contract_revisions < 1:
@@ -433,6 +555,11 @@ async def _run_builder_qa_harness(
             raise UserError(
                 "Existing Codex builder/QA harness state task does not match the requested task."
             )
+        if state.execution_backend != options.execution_backend:
+            raise UserError(
+                "Existing Codex builder/QA harness state execution_backend does not match the "
+                "requested backend."
+            )
     state_created_scratch_workspace = (
         state.created_scratch_workspace if state is not None else created_scratch_workspace
     )
@@ -475,6 +602,7 @@ async def _run_builder_qa_harness(
             workspace=workspace,
             artifact_dir=artifact_dir,
             state_path=state_path,
+            execution_backend=options.execution_backend,
             created_scratch_workspace=state_created_scratch_workspace,
             harness_context=harness_context,
             plan=plan,
@@ -486,11 +614,13 @@ async def _run_builder_qa_harness(
 
     state = state or HarnessState(
         task=task,
+        execution_backend=options.execution_backend,
         max_rounds=max_rounds,
         status="planning",
         current_round=None,
         created_scratch_workspace=created_scratch_workspace,
     )
+    state.execution_backend = options.execution_backend
     state.max_rounds = max_rounds
     planner_agent_kwargs: dict[str, Any] = {
         "name": "planner_agent",
@@ -501,53 +631,98 @@ async def _run_builder_qa_harness(
     planner_thread_options = cast(ThreadOptions | None, options.planner_thread_options)
     builder_thread_options = cast(ThreadOptions | None, options.builder_thread_options)
     qa_thread_options = cast(ThreadOptions | None, options.qa_thread_options)
-
-    planner_model_settings = (
-        dataclasses.replace(options.planner_model_settings, tool_choice="required")
-        if options.planner_model_settings is not None
-        else ModelSettings(tool_choice="required")
+    planner_model_settings = _resolve_role_model_settings(
+        options.planner_model_settings,
+        tool_choice="required" if options.execution_backend == "codex" else "auto",
+    )
+    builder_model_settings = _resolve_role_model_settings(
+        options.builder_model_settings,
+        tool_choice="required" if options.execution_backend == "codex" else "auto",
+    )
+    qa_model_settings = _resolve_role_model_settings(
+        options.qa_model_settings,
+        tool_choice="required" if options.execution_backend == "codex" else "auto",
     )
 
-    planner_agent = Agent(
-        **planner_agent_kwargs,
-        tools=[
-            codex_tool(
-                name="codex_planner",
-                default_thread_options=_resolve_nested_thread_options(
-                    planner_thread_options,
-                    workspace=workspace,
-                    sandbox_mode=options.sandbox_mode,
-                    skip_git_repo_check=options.skip_git_repo_check,
-                ),
-                on_stream=options.planner_on_stream,
-                use_run_context_thread_id=True,
-            )
-        ],
-        model_settings=planner_model_settings,
-    )
-    contract_builder_agent = Agent(
-        name="contract_builder_agent",
-        instructions=DEFAULT_CONTRACT_BUILDER_INSTRUCTIONS,
-        tools=[
-            codex_tool(
-                name="codex_builder",
-                default_thread_options=_resolve_nested_thread_options(
-                    builder_thread_options,
-                    workspace=workspace,
-                    sandbox_mode=options.sandbox_mode,
-                    skip_git_repo_check=options.skip_git_repo_check,
-                ),
-                on_stream=options.builder_on_stream,
-                use_run_context_thread_id=True,
-            )
-        ],
-        model_settings=ModelSettings(tool_choice="required"),
-        output_type=RoundContract,
-    )
-    contract_qa_agent = Agent(
-        name="contract_evaluator_agent",
-        instructions=DEFAULT_CONTRACT_QA_INSTRUCTIONS,
-        tools=[
+    if options.execution_backend == "codex":
+        planner_agent = Agent(
+            **planner_agent_kwargs,
+            tools=[
+                codex_tool(
+                    name="codex_planner",
+                    default_thread_options=_resolve_nested_thread_options(
+                        planner_thread_options,
+                        workspace=workspace,
+                        sandbox_mode=options.sandbox_mode,
+                        skip_git_repo_check=options.skip_git_repo_check,
+                    ),
+                    on_stream=options.planner_on_stream,
+                    use_run_context_thread_id=True,
+                )
+            ],
+            model_settings=planner_model_settings,
+        )
+        contract_builder_agent = Agent(
+            name="contract_builder_agent",
+            instructions=DEFAULT_CONTRACT_BUILDER_INSTRUCTIONS,
+            model=options.builder_model,
+            tools=[
+                codex_tool(
+                    name="codex_builder",
+                    default_thread_options=_resolve_nested_thread_options(
+                        builder_thread_options,
+                        workspace=workspace,
+                        sandbox_mode=options.sandbox_mode,
+                        skip_git_repo_check=options.skip_git_repo_check,
+                    ),
+                    on_stream=options.builder_on_stream,
+                    use_run_context_thread_id=True,
+                )
+            ],
+            model_settings=builder_model_settings,
+            output_type=RoundContract,
+        )
+        contract_qa_agent = Agent(
+            name="contract_evaluator_agent",
+            instructions=DEFAULT_CONTRACT_QA_INSTRUCTIONS,
+            model=options.qa_model,
+            tools=[
+                codex_tool(
+                    name="codex_qa",
+                    default_thread_options=_resolve_nested_thread_options(
+                        qa_thread_options,
+                        workspace=workspace,
+                        sandbox_mode=options.sandbox_mode,
+                        skip_git_repo_check=options.skip_git_repo_check,
+                    ),
+                    on_stream=options.qa_on_stream,
+                    use_run_context_thread_id=True,
+                )
+            ],
+            model_settings=qa_model_settings,
+            output_type=ContractReview,
+        )
+        builder_agent = Agent(
+            name="generator_agent",
+            instructions=options.builder_instructions,
+            model=options.builder_model,
+            tools=[
+                codex_tool(
+                    name="codex_builder",
+                    default_thread_options=_resolve_nested_thread_options(
+                        builder_thread_options,
+                        workspace=workspace,
+                        sandbox_mode=options.sandbox_mode,
+                        skip_git_repo_check=options.skip_git_repo_check,
+                    ),
+                    on_stream=options.builder_on_stream,
+                    use_run_context_thread_id=True,
+                )
+            ],
+            model_settings=builder_model_settings,
+            output_type=BuildRoundReport,
+        )
+        qa_tools: list[Any] = [
             codex_tool(
                 name="codex_qa",
                 default_thread_options=_resolve_nested_thread_options(
@@ -559,50 +734,66 @@ async def _run_builder_qa_harness(
                 on_stream=options.qa_on_stream,
                 use_run_context_thread_id=True,
             )
-        ],
-        model_settings=ModelSettings(tool_choice="required"),
-        output_type=ContractReview,
-    )
-    builder_agent = Agent(
-        name="generator_agent",
-        instructions=options.builder_instructions,
-        tools=[
-            codex_tool(
-                name="codex_builder",
-                default_thread_options=_resolve_nested_thread_options(
-                    builder_thread_options,
-                    workspace=workspace,
-                    sandbox_mode=options.sandbox_mode,
-                    skip_git_repo_check=options.skip_git_repo_check,
-                ),
-                on_stream=options.builder_on_stream,
-                use_run_context_thread_id=True,
-            )
-        ],
-        model_settings=ModelSettings(tool_choice="required"),
-        output_type=BuildRoundReport,
-    )
-    qa_tools: list[Any] = [
-        codex_tool(
-            name="codex_qa",
-            default_thread_options=_resolve_nested_thread_options(
-                qa_thread_options,
-                workspace=workspace,
-                sandbox_mode=options.sandbox_mode,
-                skip_git_repo_check=options.skip_git_repo_check,
-            ),
-            on_stream=options.qa_on_stream,
-            use_run_context_thread_id=True,
+        ]
+    else:
+        planner_agent = Agent(
+            **planner_agent_kwargs,
+            tools=[_build_workspace_shell_tool(workspace)],
+            model_settings=planner_model_settings,
         )
-    ]
+        contract_builder_agent = Agent(
+            name="contract_builder_agent",
+            instructions=(
+                f"{DEFAULT_CONTRACT_BUILDER_INSTRUCTIONS} Use the shell tool to inspect the "
+                "workspace and propose the contract. Do not modify files."
+            ),
+            model=options.builder_model,
+            tools=[_build_workspace_shell_tool(workspace)],
+            model_settings=builder_model_settings,
+            output_type=RoundContract,
+        )
+        contract_qa_agent = Agent(
+            name="contract_evaluator_agent",
+            instructions=(
+                f"{DEFAULT_CONTRACT_QA_INSTRUCTIONS} Use the shell tool to inspect the workspace "
+                "and validate whether the contract is aligned and testable."
+            ),
+            model=options.qa_model,
+            tools=[_build_workspace_shell_tool(workspace)],
+            model_settings=qa_model_settings,
+            output_type=ContractReview,
+        )
+        builder_agent = Agent(
+            name="generator_agent",
+            instructions=(
+                f"{options.builder_instructions} Use the shell tool for inspection and "
+                "verification, and use the apply_patch tool for file edits."
+            ),
+            model=options.builder_model,
+            tools=[
+                _build_workspace_shell_tool(workspace),
+                _build_workspace_apply_patch_tool(workspace),
+            ],
+            model_settings=builder_model_settings,
+            output_type=BuildRoundReport,
+        )
+        qa_tools = [_build_workspace_shell_tool(workspace)]
+
     if options.qa_computer is not None:
         qa_tools.append(ComputerTool(computer=options.qa_computer))
     qa_agent = Agent(
         name="evaluator_agent",
-        instructions=options.qa_instructions,
+        instructions=(
+            options.qa_instructions
+            if options.execution_backend == "codex"
+            else (
+                f"{options.qa_instructions} Use the shell tool for repo inspection and checks. "
+                "Do not modify files during QA."
+            )
+        ),
         tools=qa_tools,
-        model=DEFAULT_MODEL if options.qa_computer is not None else None,
-        model_settings=ModelSettings(tool_choice="required"),
+        model=options.qa_model or (DEFAULT_MODEL if options.qa_computer is not None else None),
+        model_settings=qa_model_settings,
         output_type=EvaluationReport,
     )
 
@@ -857,6 +1048,7 @@ async def _run_builder_qa_harness(
                 workspace=workspace,
                 artifact_dir=artifact_dir,
                 state_path=state_path,
+                execution_backend=options.execution_backend,
                 created_scratch_workspace=state_created_scratch_workspace,
                 harness_context=harness_context,
                 plan=plan,
@@ -887,6 +1079,7 @@ async def _run_builder_qa_harness(
         workspace=workspace,
         artifact_dir=artifact_dir,
         state_path=state_path,
+        execution_backend=options.execution_backend,
         created_scratch_workspace=state_created_scratch_workspace,
         harness_context=harness_context,
         plan=plan,
@@ -1077,6 +1270,7 @@ def _build_result(
     workspace: Path,
     artifact_dir: Path,
     state_path: Path,
+    execution_backend: ExecutionBackend,
     created_scratch_workspace: bool,
     harness_context: _HarnessContext,
     plan: BuildPlan,
@@ -1091,6 +1285,7 @@ def _build_result(
         workspace=str(workspace),
         artifact_dir=str(artifact_dir),
         state_file=str(state_path),
+        execution_backend=execution_backend,
         created_scratch_workspace=created_scratch_workspace,
         rounds_completed=len(qa_reports),
         final_verdict=qa_reports[-1].verdict,
@@ -1247,6 +1442,24 @@ def _resolve_nested_thread_options(
         ),
         additional_directories=configured.additional_directories if configured else None,
     )
+
+
+def _resolve_role_model_settings(
+    model_settings: ModelSettings | None,
+    *,
+    tool_choice: Literal["auto", "required"],
+) -> ModelSettings:
+    if model_settings is None:
+        return ModelSettings(tool_choice=tool_choice)
+    return dataclasses.replace(model_settings, tool_choice=tool_choice)
+
+
+def _build_workspace_shell_tool(workspace: Path) -> ShellTool:
+    return ShellTool(executor=_WorkspaceShellExecutor(workspace))
+
+
+def _build_workspace_apply_patch_tool(workspace: Path) -> ApplyPatchTool:
+    return ApplyPatchTool(editor=_WorkspaceEditor(workspace))
 
 
 def _accumulate_usage(ctx: ToolContext[Any], usage: Usage) -> None:

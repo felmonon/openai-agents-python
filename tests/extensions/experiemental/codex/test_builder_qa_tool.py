@@ -9,7 +9,7 @@ from typing import Any, Literal, cast
 
 import pytest
 
-from agents import Usage
+from agents import ApplyPatchTool, ShellTool, Usage
 from agents.exceptions import UserError
 from agents.extensions.experimental.codex import (
     BuildPlan,
@@ -324,6 +324,80 @@ async def test_codex_builder_qa_tool_adds_browser_qa_context(monkeypatch, tmp_pa
 
     assert isinstance(result, CodexBuilderQAToolResult)
     assert result.final_verdict == "pass"
+
+
+@pytest.mark.asyncio
+async def test_codex_builder_qa_tool_local_tools_backend_uses_shell_and_apply_patch(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
+        if agent.name == "planner_agent":
+            assert any(isinstance(tool, ShellTool) for tool in agent.tools)
+            assert all(not isinstance(tool, ApplyPatchTool) for tool in agent.tools)
+            return FakeRunResult(make_plan())
+        if agent.name == "contract_builder_agent":
+            assert any(isinstance(tool, ShellTool) for tool in agent.tools)
+            assert all(not isinstance(tool, ApplyPatchTool) for tool in agent.tools)
+            assert "Do not modify files." in agent.instructions
+            return FakeRunResult(make_contract(1))
+        if agent.name == "contract_evaluator_agent":
+            assert any(isinstance(tool, ShellTool) for tool in agent.tools)
+            assert all(not isinstance(tool, ApplyPatchTool) for tool in agent.tools)
+            return FakeRunResult(make_contract_review("approve", summary="contract approved"))
+        if agent.name == "generator_agent":
+            assert any(isinstance(tool, ShellTool) for tool in agent.tools)
+            assert any(isinstance(tool, ApplyPatchTool) for tool in agent.tools)
+            assert "apply_patch tool" in agent.instructions
+            return FakeRunResult(
+                BuildRoundReport(
+                    summary="built",
+                    completed_work=["cli"],
+                    validations_run=["pytest -q"],
+                    remaining_risks=[],
+                )
+            )
+        if agent.name == "evaluator_agent":
+            assert any(isinstance(tool, ShellTool) for tool in agent.tools)
+            assert all(not isinstance(tool, ApplyPatchTool) for tool in agent.tools)
+            assert "Do not modify files during QA." in agent.instructions
+            return FakeRunResult(
+                EvaluationReport(
+                    verdict="pass",
+                    summary="passed",
+                    strengths=[],
+                    issues=[],
+                    next_actions=[],
+                )
+            )
+        raise AssertionError(f"Unexpected agent: {agent.name}")
+
+    monkeypatch.setattr(
+        "agents.extensions.experimental.codex.builder_qa_tool.Runner.run",
+        fake_run,
+    )
+
+    tool = codex_builder_qa_tool(
+        working_directory=str(tmp_path / "workspace"),
+        create_scratch_workspace=False,
+        execution_backend="local_tools",
+        default_max_rounds=1,
+    )
+    input_json = json.dumps({"task": "Build a local-tools demo"})
+    context = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call-1",
+        tool_arguments=input_json,
+    )
+
+    result = await tool.on_invoke_tool(context, input_json)
+
+    assert result.execution_backend == "local_tools"
+    assert result.final_verdict == "pass"
+    assert result.planner_thread_id is None
+    assert result.builder_thread_id is None
+    assert result.qa_thread_id is None
 
 
 @pytest.mark.asyncio
