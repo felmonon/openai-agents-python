@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any, Literal, cast
+from typing import IO, Any, Literal, TypeVar, cast
 
 from pydantic import BaseModel, Field
 
@@ -68,6 +68,12 @@ class CodexBuilderQAToolParameters(BaseModel):
             "uses its configured default."
         ),
     )
+    resume: bool | None = Field(
+        default=None,
+        description=(
+            "Optional override for resuming an existing harness state from the artifact directory."
+        ),
+    )
 
 
 class BuildPlan(BaseModel):
@@ -101,6 +107,18 @@ class EvaluationReport(BaseModel):
     next_actions: list[str] = Field(default_factory=list)
 
 
+class HarnessState(BaseModel):
+    version: Literal[1] = 1
+    task: str
+    max_rounds: int
+    status: Literal["planning", "building", "qa", "completed"]
+    current_round: int | None = None
+    created_scratch_workspace: bool = False
+    builder_thread_id: str | None = None
+    qa_thread_id: str | None = None
+    final_verdict: str | None = None
+
+
 class _HarnessContext(BaseModel):
     codex_thread_id_builder: str | None = None
     codex_thread_id_qa: str | None = None
@@ -111,12 +129,14 @@ class _UnsetType:
 
 
 _UNSET = _UnsetType()
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 @dataclass(frozen=True)
 class CodexBuilderQAToolResult:
     workspace: str
     artifact_dir: str
+    state_file: str
     created_scratch_workspace: bool
     rounds_completed: int
     final_verdict: str
@@ -130,6 +150,7 @@ class CodexBuilderQAToolResult:
         return {
             "workspace": self.workspace,
             "artifact_dir": self.artifact_dir,
+            "state_file": self.state_file,
             "created_scratch_workspace": self.created_scratch_workspace,
             "rounds_completed": self.rounds_completed,
             "final_verdict": self.final_verdict,
@@ -170,6 +191,7 @@ class CodexBuilderQAToolOptions:
     sandbox_mode: SandboxMode | None = None
     working_directory: str | None = None
     skip_git_repo_check: bool | None = None
+    resume_existing_run: bool = False
     create_scratch_workspace: bool = True
     scratch_workspace_prefix: str = DEFAULT_SCRATCH_WORKSPACE_PREFIX
     artifact_dir_name: str = DEFAULT_ARTIFACT_DIR_NAME
@@ -200,6 +222,7 @@ def codex_builder_qa_tool(
     sandbox_mode: SandboxMode | None = None,
     working_directory: str | None = None,
     skip_git_repo_check: bool | None = None,
+    resume_existing_run: bool | None = None,
     create_scratch_workspace: bool | None = None,
     scratch_workspace_prefix: str | None = None,
     artifact_dir_name: str | None = None,
@@ -244,6 +267,8 @@ def codex_builder_qa_tool(
         resolved_options.working_directory = working_directory
     if skip_git_repo_check is not None:
         resolved_options.skip_git_repo_check = skip_git_repo_check
+    if resume_existing_run is not None:
+        resolved_options.resume_existing_run = resume_existing_run
     if create_scratch_workspace is not None:
         resolved_options.create_scratch_workspace = create_scratch_workspace
     if scratch_workspace_prefix is not None:
@@ -282,6 +307,7 @@ def codex_builder_qa_tool(
         ctx: ToolContext[Any],
         task: str,
         max_rounds: int | None = None,
+        resume: bool | None = None,
     ) -> CodexBuilderQAToolResult:
         """Run a planner, Codex builder, and separate QA loop for a coding task."""
 
@@ -289,6 +315,7 @@ def codex_builder_qa_tool(
             ctx=ctx,
             task=task,
             max_rounds=max_rounds or resolved_options.default_max_rounds,
+            resume=resolved_options.resume_existing_run if resume is None else resume,
             options=resolved_options,
         )
         return result
@@ -330,13 +357,67 @@ async def _run_builder_qa_harness(
     ctx: ToolContext[Any],
     task: str,
     max_rounds: int,
+    resume: bool,
     options: CodexBuilderQAToolOptions,
 ) -> CodexBuilderQAToolResult:
     workspace, created_scratch_workspace = _prepare_workspace(options)
     artifact_dir = workspace / options.artifact_dir_name
-    harness_context = _HarnessContext()
-    builder_reports: list[BuildRoundReport] = []
-    qa_reports: list[EvaluationReport] = []
+    state_path = harness_state_path(workspace, options.artifact_dir_name)
+    state = _load_existing_state(state_path)
+    if state is not None:
+        if not resume:
+            raise UserError(
+                "Existing Codex builder/QA harness state found. Re-run with resume=True or use "
+                "a different artifact_dir_name."
+            )
+        if state.task != task:
+            raise UserError(
+                "Existing Codex builder/QA harness state task does not match the requested task."
+            )
+    state_created_scratch_workspace = (
+        state.created_scratch_workspace if state is not None else created_scratch_workspace
+    )
+    harness_context = _HarnessContext(
+        codex_thread_id_builder=state.builder_thread_id if state is not None else None,
+        codex_thread_id_qa=state.qa_thread_id if state is not None else None,
+    )
+    builder_reports = _load_round_reports(
+        workspace,
+        options.artifact_dir_name,
+        "build_round_",
+        BuildRoundReport,
+    )
+    qa_reports = _load_round_reports(
+        workspace,
+        options.artifact_dir_name,
+        "qa_round_",
+        EvaluationReport,
+    )
+    latest_feedback: EvaluationReport | None = qa_reports[-1] if qa_reports else None
+    plan = _load_optional_model(plan_artifact_path(workspace, options.artifact_dir_name), BuildPlan)
+
+    if state is not None and state.status == "completed":
+        if plan is None:
+            raise UserError("Codex builder/QA harness state is completed but plan.json is missing.")
+        return _build_result(
+            workspace=workspace,
+            artifact_dir=artifact_dir,
+            state_path=state_path,
+            created_scratch_workspace=state_created_scratch_workspace,
+            harness_context=harness_context,
+            plan=plan,
+            build_reports=builder_reports,
+            qa_reports=qa_reports,
+        )
+
+    state = state or HarnessState(
+        task=task,
+        max_rounds=max_rounds,
+        status="planning",
+        current_round=None,
+        created_scratch_workspace=created_scratch_workspace,
+    )
+    state.max_rounds = max_rounds
     planner_agent_kwargs: dict[str, Any] = {
         "name": "planner_agent",
         "instructions": options.planner_instructions,
@@ -392,35 +473,70 @@ async def _run_builder_qa_harness(
         output_type=EvaluationReport,
     )
 
-    plan_result = await Runner.run(planner_agent, task)
-    _accumulate_usage(ctx, plan_result.context_wrapper.usage)
-    plan = plan_result.final_output_as(BuildPlan)
-    _write_json(plan_artifact_path(workspace, options.artifact_dir_name), plan)
-
-    latest_feedback: EvaluationReport | None = None
-
-    for round_number in range(1, max_rounds + 1):
-        build_result = await Runner.run(
-            builder_agent,
-            _build_generator_prompt(
-                task=task,
-                workspace=workspace,
-                artifact_dir_name=options.artifact_dir_name,
-                plan=plan,
-                round_number=round_number,
-                max_rounds=max_rounds,
-                latest_feedback=latest_feedback,
-            ),
-            context=harness_context,
+    if plan is None:
+        _persist_harness_state(
+            state_path,
+            state,
+            status="planning",
+            current_round=None,
+            harness_context=harness_context,
+            final_verdict=None,
         )
-        _accumulate_usage(ctx, build_result.context_wrapper.usage)
-        build_report = build_result.final_output_as(BuildRoundReport)
-        builder_reports.append(build_report)
-        _write_json(
-            build_artifact_path(workspace, options.artifact_dir_name, round_number),
-            build_report,
-        )
+        plan_result = await Runner.run(planner_agent, task)
+        _accumulate_usage(ctx, plan_result.context_wrapper.usage)
+        plan = plan_result.final_output_as(BuildPlan)
+        _write_json(plan_artifact_path(workspace, options.artifact_dir_name), plan)
 
+    next_round_number, run_builder_for_next_round = _resolve_resume_position(
+        max_rounds=max_rounds,
+        build_reports=builder_reports,
+        qa_reports=qa_reports,
+    )
+
+    for round_number in range(next_round_number, max_rounds + 1):
+        if run_builder_for_next_round:
+            _persist_harness_state(
+                state_path,
+                state,
+                status="building",
+                current_round=round_number,
+                harness_context=harness_context,
+                final_verdict=None,
+            )
+            build_result = await Runner.run(
+                builder_agent,
+                _build_generator_prompt(
+                    task=task,
+                    workspace=workspace,
+                    artifact_dir_name=options.artifact_dir_name,
+                    plan=plan,
+                    round_number=round_number,
+                    max_rounds=max_rounds,
+                    latest_feedback=latest_feedback,
+                ),
+                context=harness_context,
+            )
+            _accumulate_usage(ctx, build_result.context_wrapper.usage)
+            build_report = build_result.final_output_as(BuildRoundReport)
+            if len(builder_reports) >= round_number:
+                builder_reports[round_number - 1] = build_report
+            else:
+                builder_reports.append(build_report)
+            _write_json(
+                build_artifact_path(workspace, options.artifact_dir_name, round_number),
+                build_report,
+            )
+        else:
+            build_report = builder_reports[round_number - 1]
+
+        _persist_harness_state(
+            state_path,
+            state,
+            status="qa",
+            current_round=round_number,
+            harness_context=harness_context,
+            final_verdict=None,
+        )
         qa_server: _QAServerProcess | None = None
         if options.qa_start_command is not None:
             qa_server = await _start_qa_server(
@@ -452,7 +568,10 @@ async def _run_builder_qa_harness(
                 await _stop_qa_server(qa_server)
         _accumulate_usage(ctx, qa_result.context_wrapper.usage)
         evaluation = qa_result.final_output_as(EvaluationReport)
-        qa_reports.append(evaluation)
+        if len(qa_reports) >= round_number:
+            qa_reports[round_number - 1] = evaluation
+        else:
+            qa_reports.append(evaluation)
         latest_feedback = evaluation
         _write_json(
             qa_artifact_path(workspace, options.artifact_dir_name, round_number),
@@ -460,19 +579,44 @@ async def _run_builder_qa_harness(
         )
 
         if evaluation.verdict == "pass":
-            break
+            _persist_harness_state(
+                state_path,
+                state,
+                status="completed",
+                current_round=round_number,
+                harness_context=harness_context,
+                final_verdict=evaluation.verdict,
+            )
+            return _build_result(
+                workspace=workspace,
+                artifact_dir=artifact_dir,
+                state_path=state_path,
+                created_scratch_workspace=state_created_scratch_workspace,
+                harness_context=harness_context,
+                plan=plan,
+                build_reports=builder_reports,
+                qa_reports=qa_reports,
+            )
+
+        run_builder_for_next_round = True
 
     if not qa_reports:
         raise UserError("Codex builder/QA tool did not produce a QA report.")
 
-    return CodexBuilderQAToolResult(
-        workspace=str(workspace),
-        artifact_dir=str(artifact_dir),
-        created_scratch_workspace=created_scratch_workspace,
-        rounds_completed=len(qa_reports),
+    _persist_harness_state(
+        state_path,
+        state,
+        status="completed",
+        current_round=len(qa_reports),
+        harness_context=harness_context,
         final_verdict=qa_reports[-1].verdict,
-        builder_thread_id=harness_context.codex_thread_id_builder,
-        qa_thread_id=harness_context.codex_thread_id_qa,
+    )
+    return _build_result(
+        workspace=workspace,
+        artifact_dir=artifact_dir,
+        state_path=state_path,
+        created_scratch_workspace=state_created_scratch_workspace,
+        harness_context=harness_context,
         plan=plan,
         build_reports=builder_reports,
         qa_reports=qa_reports,
@@ -535,6 +679,10 @@ def plan_artifact_path(workspace: Path, artifact_dir_name: str) -> Path:
     return workspace / artifact_dir_name / "plan.json"
 
 
+def harness_state_path(workspace: Path, artifact_dir_name: str) -> Path:
+    return workspace / artifact_dir_name / "state.json"
+
+
 def build_artifact_path(workspace: Path, artifact_dir_name: str, round_number: int) -> Path:
     return workspace / artifact_dir_name / f"build_round_{round_number}.json"
 
@@ -550,6 +698,93 @@ def qa_server_log_path(workspace: Path, artifact_dir_name: str, round_number: in
 def _write_json(path: Path, model: BaseModel) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(model.model_dump_json(indent=2), encoding="utf-8")
+
+
+def _load_existing_state(path: Path) -> HarnessState | None:
+    return _load_optional_model(path, HarnessState)
+
+
+def _load_optional_model(path: Path, model_cls: type[ModelT]) -> ModelT | None:
+    if not path.exists():
+        return None
+    return model_cls.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _load_round_reports(
+    workspace: Path,
+    artifact_dir_name: str,
+    prefix: str,
+    model_cls: type[ModelT],
+) -> list[ModelT]:
+    reports: list[ModelT] = []
+    round_number = 1
+    while True:
+        path = workspace / artifact_dir_name / f"{prefix}{round_number}.json"
+        if not path.exists():
+            break
+        reports.append(model_cls.model_validate_json(path.read_text(encoding="utf-8")))
+        round_number += 1
+    return reports
+
+
+def _persist_harness_state(
+    path: Path,
+    state: HarnessState,
+    *,
+    status: Literal["planning", "building", "qa", "completed"],
+    current_round: int | None,
+    harness_context: _HarnessContext,
+    final_verdict: str | None,
+) -> None:
+    state.status = status
+    state.current_round = current_round
+    state.builder_thread_id = harness_context.codex_thread_id_builder
+    state.qa_thread_id = harness_context.codex_thread_id_qa
+    state.final_verdict = final_verdict
+    _write_json(path, state)
+
+
+def _resolve_resume_position(
+    *,
+    max_rounds: int,
+    build_reports: list[BuildRoundReport],
+    qa_reports: list[EvaluationReport],
+) -> tuple[int, bool]:
+    if len(qa_reports) > len(build_reports):
+        raise UserError("Codex builder/QA harness artifacts are inconsistent: QA exceeds build.")
+    if len(build_reports) > max_rounds or len(qa_reports) > max_rounds:
+        raise UserError("Codex builder/QA harness artifacts exceed the configured max_rounds.")
+    if build_reports and len(build_reports) > len(qa_reports):
+        return len(build_reports), False
+    return len(qa_reports) + 1, True
+
+
+def _build_result(
+    *,
+    workspace: Path,
+    artifact_dir: Path,
+    state_path: Path,
+    created_scratch_workspace: bool,
+    harness_context: _HarnessContext,
+    plan: BuildPlan,
+    build_reports: list[BuildRoundReport],
+    qa_reports: list[EvaluationReport],
+) -> CodexBuilderQAToolResult:
+    if not qa_reports:
+        raise UserError("Codex builder/QA tool did not produce a QA report.")
+    return CodexBuilderQAToolResult(
+        workspace=str(workspace),
+        artifact_dir=str(artifact_dir),
+        state_file=str(state_path),
+        created_scratch_workspace=created_scratch_workspace,
+        rounds_completed=len(qa_reports),
+        final_verdict=qa_reports[-1].verdict,
+        builder_thread_id=harness_context.codex_thread_id_builder,
+        qa_thread_id=harness_context.codex_thread_id_qa,
+        plan=plan,
+        build_reports=build_reports,
+        qa_reports=qa_reports,
+    )
 
 
 async def _start_qa_server(

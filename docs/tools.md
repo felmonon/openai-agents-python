@@ -857,6 +857,9 @@ Start with these option groups:
 
 -   Workspace: `working_directory` points the tool at a target repo or directory. If omitted,
     `create_scratch_workspace=True` creates a temporary scaffolded workspace instead.
+-   Resumption: the harness writes `.codex-harness/state.json` alongside the plan and per-round
+    artifacts. Set `resume_existing_run=True` or pass `resume=true` in the tool call to continue
+    from an existing state instead of starting over.
 -   Models and behavior: `planner_model`, `planner_model_settings`, and the planner / builder / QA
     instruction overrides let you steer the harness behavior.
 -   Codex execution: `builder_thread_options` and `qa_thread_options` configure the two Codex
@@ -869,5 +872,5 @@ Start with these option groups:
 -   Streaming: `builder_on_stream` and `qa_on_stream` expose the underlying Codex events for each
     role.
 
-Results include the workspace path, artifact directory, plan, per-round builder / QA reports, the
-final verdict, and the builder / QA Codex thread IDs.
+Results include the workspace path, artifact directory, state file, plan, per-round builder / QA
+reports, the final verdict, and the builder / QA Codex thread IDs.

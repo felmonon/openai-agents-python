@@ -123,14 +123,17 @@ async def test_codex_builder_qa_tool_runs_multi_round_harness(monkeypatch, tmp_p
 
     artifact_dir = tmp_path / "workspace" / ".codex-harness"
     assert (artifact_dir / "plan.json").exists()
+    assert (artifact_dir / "state.json").exists()
     assert (artifact_dir / "build_round_1.json").exists()
     assert (artifact_dir / "build_round_2.json").exists()
     assert (artifact_dir / "qa_round_1.json").exists()
     assert (artifact_dir / "qa_round_2.json").exists()
+    assert Path(result.state_file) == artifact_dir / "state.json"
 
     stringified = json.loads(str(result))
     assert stringified["final_verdict"] == "pass"
     assert stringified["rounds_completed"] == 2
+    assert stringified["state_file"] == str(artifact_dir / "state.json")
 
 
 @pytest.mark.asyncio
@@ -256,6 +259,242 @@ async def test_codex_builder_qa_tool_adds_browser_qa_context(monkeypatch, tmp_pa
 
     assert isinstance(result, CodexBuilderQAToolResult)
     assert result.final_verdict == "pass"
+
+
+@pytest.mark.asyncio
+async def test_codex_builder_qa_tool_requires_resume_for_existing_state(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    artifact_dir = workspace / ".codex-harness"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "task": "Build a demo CLI",
+                "max_rounds": 2,
+                "status": "planning",
+                "current_round": None,
+                "created_scratch_workspace": False,
+                "builder_thread_id": None,
+                "qa_thread_id": None,
+                "final_verdict": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tool = codex_builder_qa_tool(
+        working_directory=str(workspace),
+        create_scratch_workspace=False,
+        failure_error_function=None,
+    )
+    input_json = json.dumps({"task": "Build a demo CLI"})
+    context = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call-1",
+        tool_arguments=input_json,
+    )
+
+    with pytest.raises(UserError, match="Existing Codex builder/QA harness state found"):
+        await tool.on_invoke_tool(context, input_json)
+
+
+@pytest.mark.asyncio
+async def test_codex_builder_qa_tool_resumes_existing_rounds(monkeypatch, tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    artifact_dir = workspace / ".codex-harness"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "plan.json").write_text(
+        BuildPlan(
+            project_name="Demo App",
+            product_goal="Ship a demo app",
+            architecture=["CLI"],
+            milestones=["Build the CLI"],
+            acceptance_criteria=["Commands work"],
+            qa_focus=["Regression"],
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "build_round_1.json").write_text(
+        BuildRoundReport(
+            summary="builder round 1",
+            completed_work=["round-1"],
+            validations_run=["pytest -q"],
+            remaining_risks=["Need QA"],
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "qa_round_1.json").write_text(
+        EvaluationReport(
+            verdict="revise",
+            summary="qa round 1",
+            strengths=["Good structure"],
+            issues=[],
+            next_actions=["Fix remaining bug"],
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "task": "Build a demo CLI",
+                "max_rounds": 3,
+                "status": "building",
+                "current_round": 2,
+                "created_scratch_workspace": False,
+                "builder_thread_id": "builder-thread-1",
+                "qa_thread_id": "qa-thread-1",
+                "final_verdict": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fake_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
+        if agent.name == "planner_agent":
+            raise AssertionError("Planner should not run when resuming a planned harness.")
+        if agent.name == "generator_agent":
+            assert context.codex_thread_id_builder == "builder-thread-1"
+            context.codex_thread_id_builder = "builder-thread-2"
+            assert "Latest QA feedback:" in input_data
+            assert '"verdict": "revise"' in input_data
+            return FakeRunResult(
+                BuildRoundReport(
+                    summary="builder round 2",
+                    completed_work=["round-2"],
+                    validations_run=["pytest -q"],
+                    remaining_risks=[],
+                )
+            )
+        if agent.name == "evaluator_agent":
+            assert context.codex_thread_id_qa == "qa-thread-1"
+            context.codex_thread_id_qa = "qa-thread-2"
+            return FakeRunResult(
+                EvaluationReport(
+                    verdict="pass",
+                    summary="qa round 2",
+                    strengths=["Good structure"],
+                    issues=[],
+                    next_actions=[],
+                )
+            )
+        raise AssertionError(f"Unexpected agent: {agent.name}")
+
+    monkeypatch.setattr(
+        "agents.extensions.experimental.codex.builder_qa_tool.Runner.run",
+        fake_run,
+    )
+
+    tool = codex_builder_qa_tool(
+        working_directory=str(workspace),
+        create_scratch_workspace=False,
+        default_max_rounds=3,
+    )
+    input_json = json.dumps({"task": "Build a demo CLI", "resume": True})
+    context = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call-1",
+        tool_arguments=input_json,
+    )
+
+    result = await tool.on_invoke_tool(context, input_json)
+
+    assert result.final_verdict == "pass"
+    assert result.rounds_completed == 2
+    assert result.builder_thread_id == "builder-thread-2"
+    assert result.qa_thread_id == "qa-thread-2"
+    state = json.loads((artifact_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["status"] == "completed"
+    assert state["current_round"] == 2
+    assert state["final_verdict"] == "pass"
+
+
+@pytest.mark.asyncio
+async def test_codex_builder_qa_tool_returns_completed_resume_without_running(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    artifact_dir = workspace / ".codex-harness"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "plan.json").write_text(
+        BuildPlan(
+            project_name="Demo App",
+            product_goal="Ship a demo app",
+            architecture=["CLI"],
+            milestones=["Build the CLI"],
+            acceptance_criteria=["Commands work"],
+            qa_focus=["Regression"],
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "build_round_1.json").write_text(
+        BuildRoundReport(
+            summary="builder round 1",
+            completed_work=["round-1"],
+            validations_run=["pytest -q"],
+            remaining_risks=[],
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "qa_round_1.json").write_text(
+        EvaluationReport(
+            verdict="pass",
+            summary="qa round 1",
+            strengths=["Good structure"],
+            issues=[],
+            next_actions=[],
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "task": "Build a demo CLI",
+                "max_rounds": 2,
+                "status": "completed",
+                "current_round": 1,
+                "created_scratch_workspace": False,
+                "builder_thread_id": "builder-thread-1",
+                "qa_thread_id": "qa-thread-1",
+                "final_verdict": "pass",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def fail_run(agent: Any, input_data: str, context: Any = None) -> FakeRunResult:
+        raise AssertionError("Runner.run should not be called for a completed resumed harness.")
+
+    monkeypatch.setattr(
+        "agents.extensions.experimental.codex.builder_qa_tool.Runner.run",
+        fail_run,
+    )
+
+    tool = codex_builder_qa_tool(
+        working_directory=str(workspace),
+        create_scratch_workspace=False,
+    )
+    input_json = json.dumps({"task": "Build a demo CLI", "resume": True})
+    context = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call-1",
+        tool_arguments=input_json,
+    )
+
+    result = await tool.on_invoke_tool(context, input_json)
+
+    assert result.final_verdict == "pass"
+    assert result.rounds_completed == 1
+    assert result.builder_thread_id == "builder-thread-1"
+    assert result.qa_thread_id == "qa-thread-1"
 
 
 @pytest.mark.asyncio

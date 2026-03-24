@@ -167,6 +167,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable Playwright-backed browser QA against --qa-base-url.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an existing .codex-harness state in the target workspace.",
+    )
     return parser.parse_args()
 
 
@@ -231,6 +236,7 @@ async def main() -> None:
                 qa_computer=qa_computer,
                 qa_start_command=args.qa_start_command,
                 qa_base_url=args.qa_base_url,
+                resume_existing_run=args.resume,
                 builder_on_stream=make_stream_logger("builder"),
                 qa_on_stream=make_stream_logger("qa"),
             )
